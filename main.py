@@ -6,6 +6,8 @@ import cv2
 import numpy as np
 from datetime import datetime
 import uuid
+import subprocess
+import requests
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
@@ -14,305 +16,40 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, QUrl
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from PyQt5.QtMultimediaWidgets import QVideoWidget
 
-# YOLO 和 Flask 相关
 from ultralytics import YOLO
-from flask import Flask, request, jsonify, send_file, Flask
-from flask_cors import CORS
-import mimetypes
-from pathlib import Path
-
-# 屏幕截图
 from PIL import ImageGrab, Image
 
 # 全局变量
-flask_thread = None
-flask_app = None
-model = None
-is_detecting = False
+flask_thread_yolo = None
+flask_thread_carnum = None
+model_yolo = None
+model_carnum = None
 
 
-# Flask 应用
-def create_flask_app():
-    app = Flask(__name__)
-    CORS(app)
-
-    app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
-    UPLOAD_FOLDER = 'uploads'
-    RESULT_FOLDER = 'results'
-
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    os.makedirs(RESULT_FOLDER, exist_ok=True)
-    os.makedirs(os.path.join(UPLOAD_FOLDER, 'images'), exist_ok=True)
-    os.makedirs(os.path.join(UPLOAD_FOLDER, 'videos'), exist_ok=True)
-    os.makedirs(os.path.join(RESULT_FOLDER, 'images'), exist_ok=True)
-    os.makedirs(os.path.join(RESULT_FOLDER, 'videos'), exist_ok=True)
-
-    ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'webp'}
-    ALLOWED_VIDEO_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'flv'}
-
-    def allowed_file(filename, file_type):
-        if '.' not in filename:
-            return False
-        ext = filename.rsplit('.', 1)[1].lower()
-        if file_type == 'image':
-            return ext in ALLOWED_IMAGE_EXTENSIONS
-        elif file_type == 'video':
-            return ext in ALLOWED_VIDEO_EXTENSIONS
-        return False
-
-    def save_uploaded_file(file, file_type):
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        unique_id = uuid.uuid4().hex[:8]
-
-        if file_type == 'image':
-            ext = file.filename.rsplit('.', 1)[1].lower()
-            filename = f'img_{timestamp}_{unique_id}.{ext}'
-            filepath = os.path.join(UPLOAD_FOLDER, 'images', filename)
-        else:
-            ext = file.filename.rsplit('.', 1)[1].lower()
-            filename = f'vid_{timestamp}_{unique_id}.{ext}'
-            filepath = os.path.join(UPLOAD_FOLDER, 'videos', filename)
-
-        file.save(filepath)
-        return filepath, filename
-
-    def detect_image(image_path, conf_threshold=0.25):
-        global model
-        img = cv2.imread(image_path)
-        results = model(img, conf=conf_threshold)
-
-        detections = []
-        result_img = results[0].plot()
-
-        for result in results[0]:
-            box = result.boxes
-            if len(box) > 0:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = box.conf[0].cpu().numpy()
-                cls_id = int(box.cls[0].cpu().numpy())
-                cls_name = model.names[cls_id]
-                detection = {
-                    'class': cls_name,
-                    'class_id': cls_id,
-                    'confidence': float(conf),
-                    'bbox': {
-                        'x1': float(x1), 'y1': float(y1),
-                        'x2': float(x2), 'y2': float(y2)
-                    }
-                }
-                detections.append(detection)
-
-        filename = Path(image_path).stem + '_annotated.jpg'
-        result_path = os.path.join(RESULT_FOLDER, 'images', filename)
-        result_filename = filename
-        cv2.imwrite(result_path, result_img)
-
-        return detections, result_path, result_filename
-
-    def detect_video(video_path, conf_threshold=0.25):
-        global model
-        cap = cv2.VideoCapture(video_path)
-
-        if not cap.isOpened():
-            raise ValueError(f"无法打开视频: {video_path}")
-
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        if fps == 0:
-            fps = 30
-
-        filename = Path(video_path).stem + '_annotated.mp4'
-        result_path = os.path.join(RESULT_FOLDER, 'videos', filename)
-        result_filename = filename
-
-        # 使用 H.264 编码以兼容浏览器播放，添加备选编码
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
-            if not out.isOpened():
-                raise Exception("avc1编码器无法打开")
-        except Exception as e:
-            print(f"avc1编码失败，尝试XVID: {e}")
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                out = cv2.VideoWriter(result_path.replace('.mp4', '.avi'), fourcc, fps, (width, height))
-                result_filename = result_filename.replace('.mp4', '.avi')
-                result_path = result_path.replace('.mp4', '.avi')
-            except:
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
-
-        all_detections = []
-        frame_count = 0
-        detect_interval = max(1, int(fps / 5))
-
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            results = model(frame, conf=conf_threshold)
-
-            current_frame_detections = []
-            if len(results[0].boxes) > 0:
-                for i in range(len(results[0].boxes)):
-                    x1, y1, x2, y2 = results[0].boxes.xyxy[i].cpu().numpy()
-                    conf_val = results[0].boxes.conf[i].cpu().numpy()
-                    cls_id = int(results[0].boxes.cls[i].cpu().numpy())
-                    cls_name = model.names[cls_id]
-
-                    detection = {
-                        'frame': frame_count,
-                        'class': cls_name,
-                        'class_id': cls_id,
-                        'confidence': float(conf_val),
-                        'bbox': {
-                            'x1': float(x1), 'y1': float(y1),
-                            'x2': float(x2), 'y2': float(y2)
-                        }
-                    }
-                    current_frame_detections.append(detection)
-
-            if frame_count % detect_interval == 0:
-                all_detections.extend(current_frame_detections)
-
-            annotated_frame = results[0].plot()
-            out.write(annotated_frame)
-            frame_count += 1
-
-        cap.release()
-        out.release()
-
-        return all_detections, result_path, result_filename
-
-    @app.route('/api/detect/image', methods=['POST'])
-    def detect_image_api():
-        global model
-        if 'file' not in request.files:
-            return jsonify({'error': '没有上传文件'}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': '文件名为空'}), 400
-        if not allowed_file(file.filename, 'image'):
-            return jsonify({'error': '不支持的图片格式'}), 400
-
-        filepath, filename = save_uploaded_file(file, 'image')
-
-        try:
-            conf = request.form.get('conf', 0.25, type=float)
-            detections, result_path, result_filename = detect_image(filepath, conf)
-            return jsonify({
-                'success': True,
-                'filename': filename,
-                'original_path': filepath,
-                'result_path': result_path,
-                'result_filename': result_filename,
-                'detections': detections,
-                'count': len(detections)
-            })
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/detect/video', methods=['POST'])
-    def detect_video_api():
-        global model
-        if 'file' not in request.files:
-            return jsonify({'error': '没有上传文件'}), 400
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({'error': '文件名为空'}), 400
-        if not allowed_file(file.filename, 'video'):
-            return jsonify({'error': '不支持的视频格式'}), 400
-
-        filepath, filename = save_uploaded_file(file, 'video')
-
-        try:
-            conf = request.form.get('conf', 0.25, type=float)
-            detections, result_path, result_filename = detect_video(filepath, conf)
-
-            # 构建视频访问URL
-            result_url = f"/api/result/{result_filename}"
-
-            return jsonify({
-                'success': True,
-                'filename': filename,
-                'result_filename': result_filename,
-                'result_url': result_url,
-                'original_path': filepath,
-                'result_path': result_path,
-                'detections': detections,
-                'count': len(detections)
-            })
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/result/<filename>', methods=['GET'])
-    def get_result(filename):
-        if '/' in filename or '\\' in filename:
-            return jsonify({'error': '非法的文件名'}), 400
-
-        image_path = os.path.join(RESULT_FOLDER, 'images', filename)
-        video_path = os.path.join(RESULT_FOLDER, 'videos', filename)
-
-        target_path = None
-
-        if os.path.exists(image_path):
-            target_path = image_path
-        elif os.path.exists(video_path):
-            target_path = video_path
-
-        if not target_path:
-            return jsonify({'error': '结果文件不存在'}), 404
-
-        mime_type, _ = mimetypes.guess_type(target_path)
-
-        if not mime_type:
-            if filename.lower().endswith('.mp4'):
-                mime_type = 'video/mp4'
-            elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
-                mime_type = 'image/jpeg'
-            elif filename.lower().endswith('.png'):
-                mime_type = 'image/png'
-            else:
-                mime_type = 'application/octet-stream'
-
-        return send_file(target_path, mimetype=mime_type, as_attachment=False)
-
-    @app.route('/api/health', methods=['GET'])
-    def health_check():
-        return jsonify({
-            'status': 'ok',
-            'model': 'yolo26m.pt',
-            'timestamp': datetime.now().isoformat()
-        })
-
-    return app
-
-
-# 检测线程
+# 检测线程 - 通用
 class DetectionThread(QThread):
-    """后台检测线程"""
     progress = pyqtSignal(str)
-    finished = pyqtSignal(str, list)  # image_path, detections
+    finished = pyqtSignal(str, list)
     error = pyqtSignal(str)
 
-    def __init__(self, mode, file_path=None, conf=0.25, webcam_frame=None):
+    def __init__(self, mode, model_type, file_path=None, conf=0.25, webcam_frame=None):
         super().__init__()
         self.mode = mode  # 'image', 'video', 'webcam', 'screen'
+        self.model_type = model_type  # 'yolo' or 'carnum'
         self.file_path = file_path
         self.conf = conf
         self.webcam_frame = webcam_frame
 
     def run(self):
-        global model
+        global model_yolo, model_carnum
+        model = model_yolo if self.model_type == 'yolo' else model_carnum
+        model_name = "物品" if self.model_type == 'yolo' else "车牌"
+        
         try:
             if self.mode == 'image':
-                self.progress.emit("正在检测图片...")
+                self.progress.emit(f"正在检测{model_name}图片...")
                 results = model(self.file_path, conf=self.conf)
                 result_img = results[0].plot()
 
@@ -329,14 +66,13 @@ class DetectionThread(QThread):
                             'bbox': [float(x1), float(y1), float(x2), float(y2)]
                         })
 
-                # 保存结果
                 result_path = self.file_path.replace('.', '_annotated.')
                 cv2.imwrite(result_path, result_img)
 
                 self.finished.emit(result_path, detections)
 
             elif self.mode == 'video':
-                self.progress.emit("正在检测视频，请稍候...")
+                self.progress.emit(f"正在检测{model_name}视频，请稍候...")
                 cap = cv2.VideoCapture(self.file_path)
 
                 fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -346,11 +82,14 @@ class DetectionThread(QThread):
                 if fps == 0:
                     fps = 30
 
-                # 正确处理文件扩展名
                 base, ext = os.path.splitext(self.file_path)
                 result_path = f"{base}_annotated{ext}"
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                fourcc = cv2.VideoWriter_fourcc(*'avc1')
                 out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
+                if not out.isOpened():
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                    result_path = f"{base}_annotated.avi"
+                    out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
 
                 all_detections = []
                 frame_count = 0
@@ -388,7 +127,7 @@ class DetectionThread(QThread):
                 self.finished.emit(result_path, all_detections)
 
             elif self.mode == 'webcam':
-                self.progress.emit("正在检测摄像头画面...")
+                self.progress.emit(f"正在检测{model_name}摄像头画面...")
                 results = model(self.webcam_frame, conf=self.conf)
                 result_img = results[0].plot()
 
@@ -408,7 +147,7 @@ class DetectionThread(QThread):
                 self.finished.emit("", detections)
 
             elif self.mode == 'screen':
-                self.progress.emit("正在检测屏幕...")
+                self.progress.emit(f"正在检测{model_name}屏幕...")
                 results = model(self.webcam_frame, conf=self.conf)
                 result_img = results[0].plot()
 
@@ -425,7 +164,6 @@ class DetectionThread(QThread):
                             'bbox': [float(x1), float(y1), float(x2), float(y2)]
                         })
 
-                # 转换结果图像为 Qt 格式
                 result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
                 h, w, ch = result_rgb.shape
                 qimg = QImage(result_rgb.data, w, h, ch * w, QImage.Format_RGB888)
@@ -436,40 +174,81 @@ class DetectionThread(QThread):
             self.error.emit(str(e))
 
 
+# Flask 线程
+class FlaskThread(QThread):
+    log_signal = pyqtSignal(str)
+    error_signal = pyqtSignal(str)
+    is_already_running = False
+
+    def __init__(self, port=5000, model_type='yolo'):
+        super().__init__()
+        self.port = port
+        self.model_type = model_type
+
+    def run(self):
+        try:
+            cmd = [sys.executable, 'app.py', str(self.port), self.model_type]
+            subprocess.Popen(cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+            
+            time.sleep(2)
+            
+            for _ in range(10):
+                try:
+                    resp = requests.get(f'http://127.0.0.1:{self.port}/api/health', timeout=1)
+                    if resp.status_code == 200:
+                        break
+                except:
+                    pass
+                time.sleep(1)
+            
+            FlaskThread.is_already_running = True
+            self.log_signal.emit(f"{self.model_type} 服务已启动: http://127.0.0.1:{self.port}")
+
+        except Exception as e:
+            error_msg = str(e)
+            self.log_signal.emit(f"启动失败: {error_msg}")
+            self.error_signal.emit(error_msg)
+
+
 # 主窗口
 class YOLOApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.initUI()
         self.detection_thread = None
+        
+        # 物品检测相关
         self.webcam_timer = None
         self.screen_timer = None
         self.webcam_capture = None
         self.is_webcam_running = False
         self.is_screen_running = False
+        
+        # 车牌检测相关
+        self.carnum_webcam_timer = None
+        self.carnum_screen_timer = None
+        self.carnum_webcam_capture = None
+        self.is_carnum_webcam_running = False
+        self.is_carnum_screen_running = False
 
     def initUI(self):
-        self.setWindowTitle('YOLO26 智能物品识别系统')
+        self.setWindowTitle('YOLO 智能识别系统')
         self.setGeometry(100, 100, 1200, 800)
 
-        # 中心部件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
-        # 主布局
         main_layout = QVBoxLayout()
         central_widget.setLayout(main_layout)
 
-        # ===== 控制面板 =====
+        # 控制面板
         control_group = QGroupBox("控制面板")
         control_layout = QHBoxLayout()
 
-        # 启动 Flask 服务按钮
-        self.btn_start_flask = QPushButton("启动 Flask 服务")
+        self.btn_start_flask = QPushButton("启动服务")
         self.btn_start_flask.clicked.connect(self.start_flask)
         control_layout.addWidget(self.btn_start_flask)
 
-        # 置信度滑块
         control_layout.addWidget(QLabel("置信度:"))
         self.conf_slider = QSlider(Qt.Horizontal)
         self.conf_slider.setMinimum(1)
@@ -484,149 +263,300 @@ class YOLOApp(QMainWindow):
         control_group.setLayout(control_layout)
         main_layout.addWidget(control_group)
 
-        # ===== 标签页 =====
+        # 主标签页：普通检测 | 车牌检测
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
 
-        # ===== 文件检测标签页 =====
-        self.tab_file = QWidget()
-        self.tabs.addTab(self.tab_file, "文件检测")
-        self.init_file_tab()
+        # ===== 普通检测标签页 =====
+        self.tab_normal = QWidget()
+        self.tabs.addTab(self.tab_normal, "普通检测")
+        self.init_normal_tab()
 
-        # ===== 摄像头检测标签页 =====
-        self.tab_webcam = QWidget()
-        self.tabs.addTab(self.tab_webcam, "摄像头检测")
-        self.init_webcam_tab()
-
-        # ===== 屏幕检测标签页 =====
-        self.tab_screen = QWidget()
-        self.tabs.addTab(self.tab_screen, "屏幕检测")
-        self.init_screen_tab()
+        # ===== 车牌检测标签页 =====
+        self.tab_carnum = QWidget()
+        self.tabs.addTab(self.tab_carnum, "车牌检测")
+        self.init_carnum_tab()
 
         # ===== 日志标签页 =====
         self.tab_log = QWidget()
         self.tabs.addTab(self.tab_log, "运行日志")
         self.init_log_tab()
 
-        # ===== 状态栏 =====
         self.statusBar().showMessage("就绪")
 
-    def init_file_tab(self):
+    def init_normal_tab(self):
+        """普通检测 - 包含图片、视频、摄像头、屏幕四个子标签"""
         layout = QVBoxLayout()
+        
+        # 子标签页
+        self.normal_tabs = QTabWidget()
+        
+        # 图片检测
+        self.tab_normal_image = QWidget()
+        self.init_normal_image_tab()
+        self.normal_tabs.addTab(self.tab_normal_image, "图片检测")
+        
+        # 视频检测
+        self.tab_normal_video = QWidget()
+        self.init_normal_video_tab()
+        self.normal_tabs.addTab(self.tab_normal_video, "视频检测")
+        
+        # 摄像头检测
+        self.tab_normal_webcam = QWidget()
+        self.init_normal_webcam_tab()
+        self.normal_tabs.addTab(self.tab_normal_webcam, "摄像头检测")
+        
+        # 屏幕检测
+        self.tab_normal_screen = QWidget()
+        self.init_normal_screen_tab()
+        self.normal_tabs.addTab(self.tab_normal_screen, "屏幕检测")
+        
+        layout.addWidget(self.normal_tabs)
+        self.tab_normal.setLayout(layout)
 
-        # 按钮区域
+    def init_normal_image_tab(self):
+        layout = QVBoxLayout()
+        
         btn_layout = QHBoxLayout()
-
-        self.btn_select_image = QPushButton("选择图片检测")
-        self.btn_select_image.clicked.connect(lambda: self.select_file('image'))
-        btn_layout.addWidget(self.btn_select_image)
-
-        self.btn_select_video = QPushButton("选择视频检测")
-        self.btn_select_video.clicked.connect(lambda: self.select_file('video'))
-        btn_layout.addWidget(self.btn_select_video)
-
+        self.btn_normal_image = QPushButton("选择图片")
+        self.btn_normal_image.clicked.connect(lambda: self.select_file('image', 'yolo'))
+        btn_layout.addWidget(self.btn_normal_image)
         layout.addLayout(btn_layout)
+        
+        self.normal_image_label = QLabel("请选择图片进行检测")
+        self.normal_image_label.setAlignment(Qt.AlignCenter)
+        self.normal_image_label.setMinimumHeight(400)
+        self.normal_image_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
+        layout.addWidget(self.normal_image_label)
+        
+        self.normal_image_result = QTextEdit()
+        self.normal_image_result.setMaximumHeight(100)
+        self.normal_image_result.setReadOnly(True)
+        layout.addWidget(QLabel("检测结果:"))
+        layout.addWidget(self.normal_image_result)
+        
+        self.normal_image_progress = QProgressBar()
+        self.normal_image_progress.setVisible(False)
+        layout.addWidget(self.normal_image_progress)
+        
+        self.tab_normal_image.setLayout(layout)
 
-        # 结果显示区域 - 使用StackedLayout切换图片和视频
-        self.result_stacked_widget = QWidget()
-        self.result_stack_layout = QVBoxLayout()
-        self.result_stacked_widget.setLayout(self.result_stack_layout)
-
-        # 图片显示
-        self.file_result_label = QLabel("请选择图片或视频进行检测")
-        self.file_result_label.setAlignment(Qt.AlignCenter)
-        self.file_result_label.setMinimumHeight(400)
-        self.file_result_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
-        self.result_stack_layout.addWidget(self.file_result_label)
-
+    def init_normal_video_tab(self):
+        layout = QVBoxLayout()
+        
+        btn_layout = QHBoxLayout()
+        self.btn_normal_video = QPushButton("选择视频")
+        self.btn_normal_video.clicked.connect(lambda: self.select_file('video', 'yolo'))
+        btn_layout.addWidget(self.btn_normal_video)
+        layout.addLayout(btn_layout)
+        
         # 视频播放器
-        from PyQt5.QtMultimediaWidgets import QVideoWidget
-        self.video_widget = QVideoWidget()
-        self.video_widget.setMinimumHeight(400)
-        self.video_widget.setStyleSheet("border: 1px solid #ccc; background: #000;")
-        self.video_widget.setVisible(False)
-        self.result_stack_layout.addWidget(self.video_widget)
-
-        # 视频播放控制
-        self.video_player = QMediaPlayer()
-        self.video_player.setVideoOutput(self.video_widget)
-        self.video_player.stateChanged.connect(self.on_video_state_changed)
-
-        layout.addWidget(self.result_stacked_widget)
-
-        # 检测结果文本
-        self.file_result_text = QTextEdit()
-        self.file_result_text.setMaximumHeight(150)
-        self.file_result_text.setReadOnly(True)
+        self.normal_video_widget = QVideoWidget()
+        self.normal_video_widget.setMinimumHeight(400)
+        self.normal_video_widget.setStyleSheet("border: 1px solid #ccc; background: #000;")
+        layout.addWidget(self.normal_video_widget)
+        
+        self.normal_video_player = QMediaPlayer()
+        self.normal_video_player.setVideoOutput(self.normal_video_widget)
+        
+        self.normal_video_result = QTextEdit()
+        self.normal_video_result.setMaximumHeight(100)
+        self.normal_video_result.setReadOnly(True)
         layout.addWidget(QLabel("检测结果:"))
-        layout.addWidget(self.file_result_text)
+        layout.addWidget(self.normal_video_result)
+        
+        self.normal_video_progress = QProgressBar()
+        self.normal_video_progress.setVisible(False)
+        layout.addWidget(self.normal_video_progress)
+        
+        self.tab_normal_video.setLayout(layout)
 
-        # 进度条
-        self.file_progress = QProgressBar()
-        self.file_progress.setVisible(False)
-        layout.addWidget(self.file_progress)
-
-        self.tab_file.setLayout(layout)
-
-    def init_webcam_tab(self):
+    def init_normal_webcam_tab(self):
         layout = QVBoxLayout()
-
-        # 按钮区域
+        
         btn_layout = QHBoxLayout()
-
-        self.btn_webcam = QPushButton("开启摄像头检测")
-        self.btn_webcam.clicked.connect(self.toggle_webcam)
-        btn_layout.addWidget(self.btn_webcam)
-
+        self.btn_normal_webcam = QPushButton("开启摄像头")
+        self.btn_normal_webcam.clicked.connect(self.toggle_normal_webcam)
+        btn_layout.addWidget(self.btn_normal_webcam)
         layout.addLayout(btn_layout)
-
-        # 摄像头画面
-        self.webcam_label = QLabel("点击按钮开启摄像头")
-        self.webcam_label.setAlignment(Qt.AlignCenter)
-        self.webcam_label.setMinimumHeight(400)
-        self.webcam_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
-        layout.addWidget(self.webcam_label)
-
-        # 检测结果
-        self.webcam_result_text = QTextEdit()
-        self.webcam_result_text.setMaximumHeight(100)
-        self.webcam_result_text.setReadOnly(True)
+        
+        self.normal_webcam_label = QLabel("点击按钮开启摄像头")
+        self.normal_webcam_label.setAlignment(Qt.AlignCenter)
+        self.normal_webcam_label.setMinimumHeight(400)
+        self.normal_webcam_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
+        layout.addWidget(self.normal_webcam_label)
+        
+        self.normal_webcam_result = QTextEdit()
+        self.normal_webcam_result.setMaximumHeight(100)
+        self.normal_webcam_result.setReadOnly(True)
         layout.addWidget(QLabel("检测结果:"))
-        layout.addWidget(self.webcam_result_text)
+        layout.addWidget(self.normal_webcam_result)
+        
+        self.tab_normal_webcam.setLayout(layout)
 
-        self.tab_webcam.setLayout(layout)
-
-    def init_screen_tab(self):
+    def init_normal_screen_tab(self):
         layout = QVBoxLayout()
-
-        # 按钮区域
+        
         btn_layout = QHBoxLayout()
-
-        self.btn_screen = QPushButton("开始屏幕检测")
-        self.btn_screen.clicked.connect(self.toggle_screen)
-        btn_layout.addWidget(self.btn_screen)
-
-        self.btn_capture = QPushButton("截取当前屏幕")
-        self.btn_capture.clicked.connect(self.capture_screen)
-        btn_layout.addWidget(self.btn_capture)
-
+        self.btn_normal_screen = QPushButton("开启屏幕检测")
+        self.btn_normal_screen.clicked.connect(self.toggle_normal_screen)
+        btn_layout.addWidget(self.btn_normal_screen)
+        
+        self.btn_normal_capture = QPushButton("截取屏幕")
+        self.btn_normal_capture.clicked.connect(self.capture_normal_screen)
+        btn_layout.addWidget(self.btn_normal_capture)
         layout.addLayout(btn_layout)
-
-        # 屏幕画面
-        self.screen_label = QLabel("点击按钮开始屏幕检测")
-        self.screen_label.setAlignment(Qt.AlignCenter)
-        self.screen_label.setMinimumHeight(400)
-        self.screen_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
-        layout.addWidget(self.screen_label)
-
-        # 检测结果
-        self.screen_result_text = QTextEdit()
-        self.screen_result_text.setMaximumHeight(100)
-        self.screen_result_text.setReadOnly(True)
+        
+        self.normal_screen_label = QLabel("点击按钮开始屏幕检测")
+        self.normal_screen_label.setAlignment(Qt.AlignCenter)
+        self.normal_screen_label.setMinimumHeight(400)
+        self.normal_screen_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
+        layout.addWidget(self.normal_screen_label)
+        
+        self.normal_screen_result = QTextEdit()
+        self.normal_screen_result.setMaximumHeight(100)
+        self.normal_screen_result.setReadOnly(True)
         layout.addWidget(QLabel("检测结果:"))
-        layout.addWidget(self.screen_result_text)
+        layout.addWidget(self.normal_screen_result)
+        
+        self.tab_normal_screen.setLayout(layout)
 
-        self.tab_screen.setLayout(layout)
+    def init_carnum_tab(self):
+        """车牌检测 - 包含图片、视频、摄像头、屏幕四个子标签"""
+        layout = QVBoxLayout()
+        
+        # 子标签页
+        self.carnum_tabs = QTabWidget()
+        
+        # 图片检测
+        self.tab_carnum_image = QWidget()
+        self.init_carnum_image_tab()
+        self.carnum_tabs.addTab(self.tab_carnum_image, "图片检测")
+        
+        # 视频检测
+        self.tab_carnum_video = QWidget()
+        self.init_carnum_video_tab()
+        self.carnum_tabs.addTab(self.tab_carnum_video, "视频检测")
+        
+        # 摄像头检测
+        self.tab_carnum_webcam = QWidget()
+        self.init_carnum_webcam_tab()
+        self.carnum_tabs.addTab(self.tab_carnum_webcam, "摄像头检测")
+        
+        # 屏幕检测
+        self.tab_carnum_screen = QWidget()
+        self.init_carnum_screen_tab()
+        self.carnum_tabs.addTab(self.tab_carnum_screen, "屏幕检测")
+        
+        layout.addWidget(self.carnum_tabs)
+        self.tab_carnum.setLayout(layout)
+
+    def init_carnum_image_tab(self):
+        layout = QVBoxLayout()
+        
+        btn_layout = QHBoxLayout()
+        self.btn_carnum_image = QPushButton("选择图片")
+        self.btn_carnum_image.clicked.connect(lambda: self.select_file('image', 'carnum'))
+        btn_layout.addWidget(self.btn_carnum_image)
+        layout.addLayout(btn_layout)
+        
+        self.carnum_image_label = QLabel("请选择图片进行检测")
+        self.carnum_image_label.setAlignment(Qt.AlignCenter)
+        self.carnum_image_label.setMinimumHeight(400)
+        self.carnum_image_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
+        layout.addWidget(self.carnum_image_label)
+        
+        self.carnum_image_result = QTextEdit()
+        self.carnum_image_result.setMaximumHeight(100)
+        self.carnum_image_result.setReadOnly(True)
+        layout.addWidget(QLabel("检测结果:"))
+        layout.addWidget(self.carnum_image_result)
+        
+        self.carnum_image_progress = QProgressBar()
+        self.carnum_image_progress.setVisible(False)
+        layout.addWidget(self.carnum_image_progress)
+        
+        self.tab_carnum_image.setLayout(layout)
+
+    def init_carnum_video_tab(self):
+        layout = QVBoxLayout()
+        
+        btn_layout = QHBoxLayout()
+        self.btn_carnum_video = QPushButton("选择视频")
+        self.btn_carnum_video.clicked.connect(lambda: self.select_file('video', 'carnum'))
+        btn_layout.addWidget(self.btn_carnum_video)
+        layout.addLayout(btn_layout)
+        
+        # 视频播放器
+        self.carnum_video_widget = QVideoWidget()
+        self.carnum_video_widget.setMinimumHeight(400)
+        self.carnum_video_widget.setStyleSheet("border: 1px solid #ccc; background: #000;")
+        layout.addWidget(self.carnum_video_widget)
+        
+        self.carnum_video_player = QMediaPlayer()
+        self.carnum_video_player.setVideoOutput(self.carnum_video_widget)
+        
+        self.carnum_video_result = QTextEdit()
+        self.carnum_video_result.setMaximumHeight(100)
+        self.carnum_video_result.setReadOnly(True)
+        layout.addWidget(QLabel("检测结果:"))
+        layout.addWidget(self.carnum_video_result)
+        
+        self.carnum_video_progress = QProgressBar()
+        self.carnum_video_progress.setVisible(False)
+        layout.addWidget(self.carnum_video_progress)
+        
+        self.tab_carnum_video.setLayout(layout)
+
+    def init_carnum_webcam_tab(self):
+        layout = QVBoxLayout()
+        
+        btn_layout = QHBoxLayout()
+        self.btn_carnum_webcam = QPushButton("开启摄像头")
+        self.btn_carnum_webcam.clicked.connect(self.toggle_carnum_webcam)
+        btn_layout.addWidget(self.btn_carnum_webcam)
+        layout.addLayout(btn_layout)
+        
+        self.carnum_webcam_label = QLabel("点击按钮开启摄像头")
+        self.carnum_webcam_label.setAlignment(Qt.AlignCenter)
+        self.carnum_webcam_label.setMinimumHeight(400)
+        self.carnum_webcam_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
+        layout.addWidget(self.carnum_webcam_label)
+        
+        self.carnum_webcam_result = QTextEdit()
+        self.carnum_webcam_result.setMaximumHeight(100)
+        self.carnum_webcam_result.setReadOnly(True)
+        layout.addWidget(QLabel("检测结果:"))
+        layout.addWidget(self.carnum_webcam_result)
+        
+        self.tab_carnum_webcam.setLayout(layout)
+
+    def init_carnum_screen_tab(self):
+        layout = QVBoxLayout()
+        
+        btn_layout = QHBoxLayout()
+        self.btn_carnum_screen = QPushButton("开启屏幕检测")
+        self.btn_carnum_screen.clicked.connect(self.toggle_carnum_screen)
+        btn_layout.addWidget(self.btn_carnum_screen)
+        
+        self.btn_carnum_capture = QPushButton("截取屏幕")
+        self.btn_carnum_capture.clicked.connect(self.capture_carnum_screen)
+        btn_layout.addWidget(self.btn_carnum_capture)
+        layout.addLayout(btn_layout)
+        
+        self.carnum_screen_label = QLabel("点击按钮开始屏幕检测")
+        self.carnum_screen_label.setAlignment(Qt.AlignCenter)
+        self.carnum_screen_label.setMinimumHeight(400)
+        self.carnum_screen_label.setStyleSheet("border: 1px solid #ccc; background: #f5f5f5;")
+        layout.addWidget(self.carnum_screen_label)
+        
+        self.carnum_screen_result = QTextEdit()
+        self.carnum_screen_result.setMaximumHeight(100)
+        self.carnum_screen_result.setReadOnly(True)
+        layout.addWidget(QLabel("检测结果:"))
+        layout.addWidget(self.carnum_screen_result)
+        
+        self.tab_carnum_screen.setLayout(layout)
 
     def init_log_tab(self):
         layout = QVBoxLayout()
@@ -635,7 +565,6 @@ class YOLOApp(QMainWindow):
         self.log_text.setReadOnly(True)
         layout.addWidget(self.log_text)
 
-        # 清空日志按钮
         btn_clear = QPushButton("清空日志")
         btn_clear.clicked.connect(lambda: self.log_text.clear())
         layout.addWidget(btn_clear)
@@ -647,31 +576,42 @@ class YOLOApp(QMainWindow):
         self.log_text.append(f"[{timestamp}] {message}")
 
     def start_flask(self):
-        global flask_thread
+        global flask_thread_yolo, flask_thread_carnum, model_yolo, model_carnum
 
-        if flask_thread and flask_thread.is_already_running:
-            self.log("Flask 服务已在运行中")
+        if flask_thread_yolo and flask_thread_yolo.is_already_running:
+            self.log("服务已在运行中")
             return
 
-        # 启动 Flask 线程
-        flask_thread = FlaskThread()
-        flask_thread.log_signal.connect(self.log)
-        flask_thread.error_signal.connect(lambda e: self.on_flask_error(e))
-        flask_thread.start()
+        try:
+            self.log("正在加载 YOLO 模型...")
+            model_yolo = YOLO('yolo26x.pt')
+            self.log("物品检测模型加载成功!")
 
-        self.btn_start_flask.setEnabled(False)
-        self.btn_start_flask.setText("Flask 服务运行中")
+            self.log("正在加载车牌模型...")
+            model_carnum = YOLO('yolo_carnum_best.pt')
+            self.log("车牌检测模型加载成功!")
 
-    def on_flask_error(self, error):
-        self.btn_start_flask.setEnabled(True)
-        self.btn_start_flask.setText("启动 Flask 服务")
-        QMessageBox.critical(self, "错误", f"启动失败: {error}")
+            flask_thread_yolo = FlaskThread(5000, 'yolo')
+            flask_thread_yolo.log_signal.connect(self.log)
+            flask_thread_yolo.start()
 
-    def select_file(self, file_type):
-        global model
+            flask_thread_carnum = FlaskThread(5001, 'carnum')
+            flask_thread_carnum.log_signal.connect(self.log)
+            flask_thread_carnum.start()
 
+            self.btn_start_flask.setEnabled(False)
+            self.btn_start_flask.setText("服务运行中")
+
+        except Exception as e:
+            self.log(f"启动失败: {e}")
+            QMessageBox.critical(self, "错误", f"启动失败: {e}")
+
+    def select_file(self, file_type, detect_type):
+        global model_yolo, model_carnum
+
+        model = model_yolo if detect_type == 'yolo' else model_carnum
         if model is None:
-            QMessageBox.warning(self, "警告", "请先启动 Flask 服务")
+            QMessageBox.warning(self, "警告", "请先启动服务")
             return
 
         if file_type == 'image':
@@ -688,101 +628,132 @@ class YOLOApp(QMainWindow):
 
         conf = self.conf_slider.value() / 100
         self.log(f"开始检测: {os.path.basename(file_path)}")
-        self.file_progress.setVisible(True)
-        self.file_progress.setRange(0, 0)  # 不确定进度
 
-        # 启动检测线程
-        self.detection_thread = DetectionThread(file_type, file_path, conf)
-        self.detection_thread.progress.connect(lambda m: self.log(m))
-        self.detection_thread.finished.connect(lambda path, dets: self.on_detection_finished(path, dets))
-        self.detection_thread.error.connect(lambda e: self.on_detection_error(e))
-        self.detection_thread.start()
+        # 根据检测类型和文件类型设置对应的控件
+        if detect_type == 'yolo':
+            if file_type == 'image':
+                progress = self.normal_image_progress
+                progress.setVisible(True)
+            else:
+                progress = self.normal_video_progress
+                progress.setVisible(True)
+            progress.setRange(0, 0)
+            
+            self.detection_thread = DetectionThread(file_type, 'yolo', file_path, conf)
+            self.detection_thread.progress.connect(lambda m: self.log(m))
+            self.detection_thread.finished.connect(lambda path, dets: self.on_image_finished(path, dets, 'yolo', file_type))
+            self.detection_thread.error.connect(lambda e: self.on_detection_error(e))
+            self.detection_thread.start()
+        else:
+            if file_type == 'image':
+                progress = self.carnum_image_progress
+                progress.setVisible(True)
+            else:
+                progress = self.carnum_video_progress
+                progress.setVisible(True)
+            progress.setRange(0, 0)
+            
+            self.detection_thread = DetectionThread(file_type, 'carnum', file_path, conf)
+            self.detection_thread.progress.connect(lambda m: self.log(m))
+            self.detection_thread.finished.connect(lambda path, dets: self.on_image_finished(path, dets, 'carnum', file_type))
+            self.detection_thread.error.connect(lambda e: self.on_detection_error(e))
+            self.detection_thread.start()
 
-    def on_detection_finished(self, result_path, detections):
-        self.file_progress.setVisible(False)
+    def on_image_finished(self, result_path, detections, detect_type, file_type):
         self.log(f"检测完成! 发现 {len(detections)} 个目标")
 
-        # 显示检测结果
-        result_text = f"检测到 {len(detections)} 个目标:\n"
-        for i, det in enumerate(detections[:10]):  # 最多显示10个
-            result_text += f"{i + 1}. {det['class']} - {det['confidence']:.2f}\n"
-
+        result_msg = f"检测到 {len(detections)} 个目标:\n"
+        for i, det in enumerate(detections[:10]):
+            result_msg += f"{i + 1}. {det['class']} - {det['confidence']:.2f}\n"
         if len(detections) > 10:
-            result_text += f"... 还有 {len(detections) - 10} 个目标"
+            result_msg += f"... 还有 {len(detections) - 10} 个目标"
 
-        self.file_result_text.setText(result_text)
-
-        # 显示结果 - 根据文件类型判断是图片还是视频
-        if result_path and os.path.exists(result_path):
-            # 检查文件扩展名
-            video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv']
-            is_video = any(result_path.lower().endswith(ext) for ext in video_extensions)
-
-            if is_video:
-                # 视频播放
-                self.log(f"正在播放视频: {result_path}")
-                self.file_result_label.setVisible(False)
-                self.video_widget.setVisible(True)
-                self.video_player.setMedia(QMediaContent(QUrl.fromLocalFile(result_path)))
-                self.video_player.play()
+        # 根据检测类型和文件类型显示结果
+        if detect_type == 'yolo':
+            if file_type == 'image':
+                self.normal_image_progress.setVisible(False)
+                self.normal_image_result.setText(result_msg)
+                if result_path and os.path.exists(result_path):
+                    pixmap = QPixmap(result_path)
+                    if not pixmap.isNull():
+                        scaled_pixmap = pixmap.scaled(
+                            self.normal_image_label.size(),
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation
+                        )
+                        self.normal_image_label.setPixmap(scaled_pixmap)
             else:
-                # 图片显示
-                self.video_player.stop()
-                self.video_widget.setVisible(False)
-                self.file_result_label.setVisible(True)
-                pixmap = QPixmap(result_path)
-                if not pixmap.isNull():
-                    # 缩放图片适应显示
-                    scaled_pixmap = pixmap.scaled(
-                        self.file_result_label.size(),
-                        Qt.KeepAspectRatio,
-                        Qt.SmoothTransformation
-                    )
-                    self.file_result_label.setPixmap(scaled_pixmap)
-
-    def on_video_state_changed(self, state):
-        if state == QMediaPlayer.StoppedState:
-            self.log("视频播放完成")
+                self.normal_video_progress.setVisible(False)
+                self.normal_video_result.setText(result_msg)
+                if result_path and os.path.exists(result_path):
+                    self.log(f"正在播放视频: {result_path}")
+                    self.normal_video_player.stop()
+                    media_content = QMediaContent(QUrl.fromLocalFile(os.path.abspath(result_path)))
+                    self.normal_video_player.setMedia(media_content)
+                    self.normal_video_player.play()
+        else:
+            if file_type == 'image':
+                self.carnum_image_progress.setVisible(False)
+                self.carnum_image_result.setText(result_msg)
+                if result_path and os.path.exists(result_path):
+                    pixmap = QPixmap(result_path)
+                    if not pixmap.isNull():
+                        scaled_pixmap = pixmap.scaled(
+                            self.carnum_image_label.size(),
+                            Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation
+                        )
+                        self.carnum_image_label.setPixmap(scaled_pixmap)
+            else:
+                self.carnum_video_progress.setVisible(False)
+                self.carnum_video_result.setText(result_msg)
+                if result_path and os.path.exists(result_path):
+                    self.log(f"正在播放视频: {result_path}")
+                    self.carnum_video_player.stop()
+                    media_content = QMediaContent(QUrl.fromLocalFile(os.path.abspath(result_path)))
+                    self.carnum_video_player.setMedia(media_content)
+                    self.carnum_video_player.play()
 
     def on_detection_error(self, error):
-        self.file_progress.setVisible(False)
+        self.normal_image_progress.setVisible(False)
+        self.normal_video_progress.setVisible(False)
+        self.carnum_image_progress.setVisible(False)
+        self.carnum_video_progress.setVisible(False)
         self.log(f"检测错误: {error}")
         QMessageBox.critical(self, "错误", f"检测失败: {error}")
 
-    def toggle_webcam(self):
-        global model
+    # ===== 普通检测 - 摄像头 =====
+    def toggle_normal_webcam(self):
+        global model_yolo
 
-        if model is None:
-            QMessageBox.warning(self, "警告", "请先启动 Flask 服务")
+        if model_yolo is None:
+            QMessageBox.warning(self, "警告", "请先启动服务")
             return
 
         if self.is_webcam_running:
-            # 停止摄像头
             self.is_webcam_running = False
             if self.webcam_capture:
                 self.webcam_capture.release()
             if self.webcam_timer:
                 self.webcam_timer.stop()
-            self.btn_webcam.setText("开启摄像头检测")
-            self.webcam_label.setText("摄像头已关闭")
-            self.log("摄像头检测已停止")
+            self.btn_normal_webcam.setText("开启摄像头")
+            self.normal_webcam_label.setText("摄像头已关闭")
+            self.log("普通检测摄像头已停止")
         else:
-            # 开启摄像头
             self.webcam_capture = cv2.VideoCapture(0)
             if not self.webcam_capture.isOpened():
                 QMessageBox.critical(self, "错误", "无法打开摄像头")
                 return
 
             self.is_webcam_running = True
-            self.btn_webcam.setText("关闭摄像头检测")
-            self.log("摄像头检测已开启")
+            self.btn_normal_webcam.setText("关闭摄像头")
+            self.log("普通检测摄像头已开启")
 
-            # 定时器更新画面
             self.webcam_timer = QTimer()
-            self.webcam_timer.timeout.connect(self.update_webcam)
-            self.webcam_timer.start(30)  # 约30fps
+            self.webcam_timer.timeout.connect(self.update_normal_webcam)
+            self.webcam_timer.start(30)
 
-    def update_webcam(self):
+    def update_normal_webcam(self):
         if not self.is_webcam_running or not self.webcam_capture:
             return
 
@@ -790,109 +761,98 @@ class YOLOApp(QMainWindow):
         if not ret:
             return
 
-        # 复制帧用于检测
         frame_copy = frame.copy()
-
-        # 检测
         conf = self.conf_slider.value() / 100
-        results = model(frame_copy, conf=conf)
+        results = model_yolo(frame_copy, conf=conf)
         result_img = results[0].plot()
 
-        # 显示结果
         result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
         h, w, ch = result_rgb.shape
         qimg = QImage(result_rgb.data, w, h, ch * w, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg)
 
         scaled_pixmap = pixmap.scaled(
-            self.webcam_label.size(),
+            self.normal_webcam_label.size(),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
-        self.webcam_label.setPixmap(scaled_pixmap)
+        self.normal_webcam_label.setPixmap(scaled_pixmap)
 
-        # 显示检测结果
+        # 检测结果
         detections = []
         if len(results[0].boxes) > 0:
             for i in range(len(results[0].boxes)):
                 conf_val = results[0].boxes.conf[i].cpu().numpy()
                 cls_id = int(results[0].boxes.cls[i].cpu().numpy())
-                cls_name = model.names[cls_id]
+                cls_name = model_yolo.names[cls_id]
                 detections.append(f"{cls_name} ({conf_val:.2f})")
+        self.normal_webcam_result.setText("\n".join(detections) if detections else "未检测到目标")
 
-        self.webcam_result_text.setText("\n".join(detections) if detections else "未检测到目标")
+    # ===== 普通检测 - 屏幕 =====
+    def toggle_normal_screen(self):
+        global model_yolo
 
-    def toggle_screen(self):
-        global model
-
-        if model is None:
-            QMessageBox.warning(self, "警告", "请先启动 Flask 服务")
+        if model_yolo is None:
+            QMessageBox.warning(self, "警告", "请先启动服务")
             return
 
         if self.is_screen_running:
             self.is_screen_running = False
             if self.screen_timer:
                 self.screen_timer.stop()
-            self.btn_screen.setText("开始屏幕检测")
-            self.screen_label.setText("屏幕检测已停止")
-            self.log("屏幕检测已停止")
+            self.btn_normal_screen.setText("开启屏幕检测")
+            self.log("普通检测屏幕检测已停止")
         else:
             self.is_screen_running = True
-            self.btn_screen.setText("停止屏幕检测")
-            self.log("屏幕检测已开启")
+            self.btn_normal_screen.setText("停止屏幕检测")
+            self.log("普通检测屏幕检测已开启")
 
             self.screen_timer = QTimer()
-            self.screen_timer.timeout.connect(self.update_screen)
-            self.screen_timer.start(100)  # 约10fps
+            self.screen_timer.timeout.connect(self.update_normal_screen)
+            self.screen_timer.start(100)
 
-    def update_screen(self):
+    def update_normal_screen(self):
         if not self.is_screen_running:
             return
 
         try:
-            # 截取屏幕
             screen = ImageGrab.grab()
             frame = np.array(screen)
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-            # 检测
             conf = self.conf_slider.value() / 100
-            results = model(frame, conf=conf)
+            results = model_yolo(frame, conf=conf)
             result_img = results[0].plot()
 
-            # 显示结果
             result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
             h, w, ch = result_rgb.shape
             qimg = QImage(result_rgb.data, w, h, ch * w, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(qimg)
 
             scaled_pixmap = pixmap.scaled(
-                self.screen_label.size(),
+                self.normal_screen_label.size(),
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
-            self.screen_label.setPixmap(scaled_pixmap)
+            self.normal_screen_label.setPixmap(scaled_pixmap)
 
-            # 显示检测结果
             detections = []
             if len(results[0].boxes) > 0:
                 for i in range(len(results[0].boxes)):
                     conf_val = results[0].boxes.conf[i].cpu().numpy()
                     cls_id = int(results[0].boxes.cls[i].cpu().numpy())
-                    cls_name = model.names[cls_id]
+                    cls_name = model_yolo.names[cls_id]
                     detections.append(f"{cls_name} ({conf_val:.2f})")
-
-            self.screen_result_text.setText("\n".join(detections) if detections else "未检测到目标")
+            self.normal_screen_result.setText("\n".join(detections) if detections else "未检测到目标")
 
         except Exception as e:
-            self.log(f"屏幕检测错误: {e}")
+            self.log(f"普通检测屏幕检测错误: {e}")
 
-    def capture_screen(self):
-        """截取当前屏幕并进行检测"""
-        global model
+    def capture_normal_screen(self):
+        global model_yolo
 
-        if model is None:
-            QMessageBox.warning(self, "警告", "请先启动 Flask 服务")
+        if model_yolo is None:
+            QMessageBox.warning(self, "警告", "请先启动服务")
             return
 
         try:
@@ -902,92 +862,228 @@ class YOLOApp(QMainWindow):
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             conf = self.conf_slider.value() / 100
-            results = model(frame, conf=conf)
+            results = model_yolo(frame, conf=conf)
             result_img = results[0].plot()
 
-            # 保存结果
-            result_path = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}_annotated.jpg"
+            result_path = f"screen_{datetime.now().strftime('%Y%m%d_%H%M%S')}_annotated.jpg"
             cv2.imwrite(result_path, result_img)
 
-            # 显示结果
             result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
             h, w, ch = result_rgb.shape
             qimg = QImage(result_rgb.data, w, h, ch * w, QImage.Format_RGB888)
             pixmap = QPixmap.fromImage(qimg)
 
             scaled_pixmap = pixmap.scaled(
-                self.screen_label.size(),
+                self.normal_screen_label.size(),
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
-            self.screen_label.setPixmap(scaled_pixmap)
+            self.normal_screen_label.setPixmap(scaled_pixmap)
 
-            # 显示检测结果
             detections = []
             if len(results[0].boxes) > 0:
                 for i in range(len(results[0].boxes)):
                     conf_val = results[0].boxes.conf[i].cpu().numpy()
                     cls_id = int(results[0].boxes.cls[i].cpu().numpy())
-                    cls_name = model.names[cls_id]
+                    cls_name = model_yolo.names[cls_id]
                     detections.append(f"{cls_name} ({conf_val:.2f})")
+            self.normal_screen_result.setText("\n".join(detections) if detections else "未检测到目标")
 
-            self.screen_result_text.setText("\n".join(detections) if detections else "未检测到目标")
-
-            self.log(f"屏幕截取完成，结果已保存: {result_path}")
+            self.log(f"屏幕截取完成: {result_path}")
 
         except Exception as e:
             self.log(f"屏幕截取错误: {e}")
             QMessageBox.critical(self, "错误", f"屏幕截取失败: {e}")
 
+    # ===== 车牌检测 - 摄像头 =====
+    def toggle_carnum_webcam(self):
+        global model_carnum
+
+        if model_carnum is None:
+            QMessageBox.warning(self, "警告", "请先启动服务")
+            return
+
+        if self.is_carnum_webcam_running:
+            self.is_carnum_webcam_running = False
+            if self.carnum_webcam_capture:
+                self.carnum_webcam_capture.release()
+            if self.carnum_webcam_timer:
+                self.carnum_webcam_timer.stop()
+            self.btn_carnum_webcam.setText("开启摄像头")
+            self.carnum_webcam_label.setText("摄像头已关闭")
+            self.log("车牌检测摄像头已停止")
+        else:
+            self.carnum_webcam_capture = cv2.VideoCapture(0)
+            if not self.carnum_webcam_capture.isOpened():
+                QMessageBox.critical(self, "错误", "无法打开摄像头")
+                return
+
+            self.is_carnum_webcam_running = True
+            self.btn_carnum_webcam.setText("关闭摄像头")
+            self.log("车牌检测摄像头已开启")
+
+            self.carnum_webcam_timer = QTimer()
+            self.carnum_webcam_timer.timeout.connect(self.update_carnum_webcam)
+            self.carnum_webcam_timer.start(30)
+
+    def update_carnum_webcam(self):
+        if not self.is_carnum_webcam_running or not self.carnum_webcam_capture:
+            return
+
+        ret, frame = self.carnum_webcam_capture.read()
+        if not ret:
+            return
+
+        frame_copy = frame.copy()
+        conf = self.conf_slider.value() / 100
+        results = model_carnum(frame_copy, conf=conf)
+        result_img = results[0].plot()
+
+        result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
+        h, w, ch = result_rgb.shape
+        qimg = QImage(result_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg)
+
+        scaled_pixmap = pixmap.scaled(
+            self.carnum_webcam_label.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        self.carnum_webcam_label.setPixmap(scaled_pixmap)
+
+        detections = []
+        if len(results[0].boxes) > 0:
+            for i in range(len(results[0].boxes)):
+                conf_val = results[0].boxes.conf[i].cpu().numpy()
+                cls_id = int(results[0].boxes.cls[i].cpu().numpy())
+                cls_name = model_carnum.names[cls_id]
+                detections.append(f"{cls_name} ({conf_val:.2f})")
+        self.carnum_webcam_result.setText("\n".join(detections) if detections else "未检测到目标")
+
+    # ===== 车牌检测 - 屏幕 =====
+    def toggle_carnum_screen(self):
+        global model_carnum
+
+        if model_carnum is None:
+            QMessageBox.warning(self, "警告", "请先启动服务")
+            return
+
+        if self.is_carnum_screen_running:
+            self.is_carnum_screen_running = False
+            if self.carnum_screen_timer:
+                self.carnum_screen_timer.stop()
+            self.btn_carnum_screen.setText("开启屏幕检测")
+            self.log("车牌检测屏幕检测已停止")
+        else:
+            self.is_carnum_screen_running = True
+            self.btn_carnum_screen.setText("停止屏幕检测")
+            self.log("车牌检测屏幕检测已开启")
+
+            self.carnum_screen_timer = QTimer()
+            self.carnum_screen_timer.timeout.connect(self.update_carnum_screen)
+            self.carnum_screen_timer.start(100)
+
+    def update_carnum_screen(self):
+        if not self.is_carnum_screen_running:
+            return
+
+        try:
+            screen = ImageGrab.grab()
+            frame = np.array(screen)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            conf = self.conf_slider.value() / 100
+            results = model_carnum(frame, conf=conf)
+            result_img = results[0].plot()
+
+            result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
+            h, w, ch = result_rgb.shape
+            qimg = QImage(result_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+
+            scaled_pixmap = pixmap.scaled(
+                self.carnum_screen_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self.carnum_screen_label.setPixmap(scaled_pixmap)
+
+            detections = []
+            if len(results[0].boxes) > 0:
+                for i in range(len(results[0].boxes)):
+                    conf_val = results[0].boxes.conf[i].cpu().numpy()
+                    cls_id = int(results[0].boxes.cls[i].cpu().numpy())
+                    cls_name = model_carnum.names[cls_id]
+                    detections.append(f"{cls_name} ({conf_val:.2f})")
+            self.carnum_screen_result.setText("\n".join(detections) if detections else "未检测到目标")
+
+        except Exception as e:
+            self.log(f"车牌检测屏幕检测错误: {e}")
+
+    def capture_carnum_screen(self):
+        global model_carnum
+
+        if model_carnum is None:
+            QMessageBox.warning(self, "警告", "请先启动服务")
+            return
+
+        try:
+            self.log("正在截取车牌屏幕...")
+            screen = ImageGrab.grab()
+            frame = np.array(screen)
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            conf = self.conf_slider.value() / 100
+            results = model_carnum(frame, conf=conf)
+            result_img = results[0].plot()
+
+            result_path = f"carnum_screen_{datetime.now().strftime('%Y%m%d_%H%M%S')}_annotated.jpg"
+            cv2.imwrite(result_path, result_img)
+
+            result_rgb = cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB)
+            h, w, ch = result_rgb.shape
+            qimg = QImage(result_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+            pixmap = QPixmap.fromImage(qimg)
+
+            scaled_pixmap = pixmap.scaled(
+                self.carnum_screen_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation
+            )
+            self.carnum_screen_label.setPixmap(scaled_pixmap)
+
+            detections = []
+            if len(results[0].boxes) > 0:
+                for i in range(len(results[0].boxes)):
+                    conf_val = results[0].boxes.conf[i].cpu().numpy()
+                    cls_id = int(results[0].boxes.cls[i].cpu().numpy())
+                    cls_name = model_carnum.names[cls_id]
+                    detections.append(f"{cls_name} ({conf_val:.2f})")
+            self.carnum_screen_result.setText("\n".join(detections) if detections else "未检测到目标")
+
+            self.log(f"车牌屏幕截取完成: {result_path}")
+
+        except Exception as e:
+            self.log(f"车牌屏幕截取错误: {e}")
+            QMessageBox.critical(self, "错误", f"屏幕截取失败: {e}")
+
     def closeEvent(self, event):
-        # 关闭时清理资源
         if self.is_webcam_running and self.webcam_capture:
             self.webcam_capture.release()
         if self.webcam_timer:
             self.webcam_timer.stop()
         if self.screen_timer:
             self.screen_timer.stop()
+        if self.is_carnum_webcam_running and self.carnum_webcam_capture:
+            self.carnum_webcam_capture.release()
+        if self.carnum_webcam_timer:
+            self.carnum_webcam_timer.stop()
+        if self.carnum_screen_timer:
+            self.carnum_screen_timer.stop()
         event.accept()
 
 
-# Flask 线程
-class FlaskThread(QThread):
-    log_signal = pyqtSignal(str)
-    error_signal = pyqtSignal(str)
-    is_already_running = False
-
-    def __init__(self):
-        super().__init__()
-
-    def run(self):
-        global flask_app, model
-        try:
-            self.log_signal.emit("正在加载 YOLO 模型...")
-
-            # 加载模型
-            if model is None:
-                model = YOLO('yolo26m.pt')
-
-            self.log_signal.emit("YOLO 模型加载成功!")
-            self.log_signal.emit("正在启动 Flask 服务...")
-
-            flask_app = create_flask_app()
-            FlaskThread.is_already_running = True
-            self.log_signal.emit("Flask 服务已启动: http://127.0.0.1:5000")
-
-            # 启动 Flask
-            flask_app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-
-        except Exception as e:
-            error_msg = str(e)
-            self.log_signal.emit(f"启动失败: {error_msg}")
-            self.error_signal.emit(error_msg)
-            import traceback
-            traceback.print_exc()
-
-
 if __name__ == '__main__':
-    # 检查依赖
     try:
         from PyQt5.QtWidgets import QApplication
     except ImportError:
