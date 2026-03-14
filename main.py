@@ -8,6 +8,7 @@ from datetime import datetime
 import uuid
 import subprocess
 import requests
+import torch
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
@@ -26,6 +27,9 @@ flask_thread_yolo = None
 flask_thread_carnum = None
 model_yolo = None
 model_carnum = None
+
+# 检测设备
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 # 检测线程 - 通用
@@ -75,25 +79,28 @@ class DetectionThread(QThread):
                 self.progress.emit(f"正在检测{model_name}视频，请稍候...")
                 cap = cv2.VideoCapture(self.file_path)
 
-                fps = int(cap.get(cv2.CAP_PROP_FPS))
+                video_fps = int(cap.get(cv2.CAP_PROP_FPS))
                 width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-                if fps == 0:
-                    fps = 30
+                if video_fps == 0:
+                    video_fps = 30
 
                 base, ext = os.path.splitext(self.file_path)
                 result_path = f"{base}_annotated{ext}"
                 fourcc = cv2.VideoWriter_fourcc(*'avc1')
-                out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
+                out = cv2.VideoWriter(result_path, fourcc, video_fps, (width, height))
                 if not out.isOpened():
                     fourcc = cv2.VideoWriter_fourcc(*'XVID')
                     result_path = f"{base}_annotated.avi"
-                    out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
+                    out = cv2.VideoWriter(result_path, fourcc, video_fps, (width, height))
 
                 all_detections = []
                 frame_count = 0
-                detect_interval = max(1, int(fps / 5))
+                
+                # 计时变量
+                start_time = time.time()
+                detect_interval = max(1, int(video_fps / 5))
 
                 while cap.isOpened():
                     ret, frame = cap.read()
@@ -119,10 +126,17 @@ class DetectionThread(QThread):
                     frame_count += 1
 
                     if frame_count % 30 == 0:
-                        self.progress.emit(f"已处理 {frame_count} 帧...")
+                        elapsed = time.time() - start_time
+                        current_fps = frame_count / elapsed if elapsed > 0 else 0
+                        self.progress.emit(f"已处理 {frame_count} 帧... 当前速度: {current_fps:.1f} FPS")
 
                 cap.release()
                 out.release()
+                
+                # 计算总耗时和平均 FPS
+                total_time = time.time() - start_time
+                avg_fps = frame_count / total_time if total_time > 0 else 0
+                self.progress.emit(f"视频检测完成! 总帧数: {frame_count}, 总耗时: {total_time:.2f}秒, 平均速度: {avg_fps:.1f} FPS")
 
                 self.finished.emit(result_path, all_detections)
 
@@ -223,11 +237,20 @@ class YOLOApp(QMainWindow):
         self.webcam_capture = None
         self.is_webcam_running = False
         self.is_screen_running = False
+        # FPS 计数器
+        self.webcam_frame_count = 0
+        self.webcam_last_time = time.time()
+        self.screen_frame_count = 0
+        self.screen_last_time = time.time()
         
         # 车牌检测相关
         self.carnum_webcam_timer = None
         self.carnum_screen_timer = None
         self.carnum_webcam_capture = None
+        self.carnum_webcam_frame_count = 0
+        self.carnum_webcam_last_time = time.time()
+        self.carnum_screen_frame_count = 0
+        self.carnum_screen_last_time = time.time()
         self.is_carnum_webcam_running = False
         self.is_carnum_screen_running = False
 
@@ -583,12 +606,20 @@ class YOLOApp(QMainWindow):
             return
 
         try:
+            # 显示设备信息
+            if torch.cuda.is_available():
+                self.log(f"使用 GPU 加速: {torch.cuda.get_device_name(0)}")
+            else:
+                self.log("使用 CPU 推理")
+
             self.log("正在加载 YOLO 模型...")
             model_yolo = YOLO('yolo26x.pt')
+            model_yolo.to(DEVICE)  # 使用 GPU 加速
             self.log("物品检测模型加载成功!")
 
             self.log("正在加载车牌模型...")
             model_carnum = YOLO('yolo_carnum_best.pt')
+            model_carnum.to(DEVICE)  # 使用 GPU 加速
             self.log("车牌检测模型加载成功!")
 
             flask_thread_yolo = FlaskThread(5000, 'yolo')
@@ -745,6 +776,10 @@ class YOLOApp(QMainWindow):
                 QMessageBox.critical(self, "错误", "无法打开摄像头")
                 return
 
+            # 重置 FPS 计数器
+            self.webcam_frame_count = 0
+            self.webcam_last_time = time.time()
+            
             self.is_webcam_running = True
             self.btn_normal_webcam.setText("关闭摄像头")
             self.log("普通检测摄像头已开启")
@@ -778,6 +813,19 @@ class YOLOApp(QMainWindow):
         )
         self.normal_webcam_label.setPixmap(scaled_pixmap)
 
+        # 计算 FPS
+        self.webcam_frame_count += 1
+        current_time = time.time()
+        elapsed = current_time - self.webcam_last_time
+        fps = 0
+        if elapsed >= 1.0:
+            fps = self.webcam_frame_count / elapsed
+            self.webcam_frame_count = 0
+            self.webcam_last_time = current_time
+            # 立即显示 FPS
+            self.normal_webcam_result.setText(f"未检测到目标\n检测速度: {fps:.1f} FPS")
+            return
+
         # 检测结果
         detections = []
         if len(results[0].boxes) > 0:
@@ -786,7 +834,9 @@ class YOLOApp(QMainWindow):
                 cls_id = int(results[0].boxes.cls[i].cpu().numpy())
                 cls_name = model_yolo.names[cls_id]
                 detections.append(f"{cls_name} ({conf_val:.2f})")
-        self.normal_webcam_result.setText("\n".join(detections) if detections else "未检测到目标")
+        
+        result_text = "\n".join(detections) if detections else "未检测到目标"
+        self.normal_webcam_result.setText(result_text)
 
     # ===== 普通检测 - 屏幕 =====
     def toggle_normal_screen(self):
@@ -803,6 +853,10 @@ class YOLOApp(QMainWindow):
             self.btn_normal_screen.setText("开启屏幕检测")
             self.log("普通检测屏幕检测已停止")
         else:
+            # 重置 FPS 计数器
+            self.screen_frame_count = 0
+            self.screen_last_time = time.time()
+            
             self.is_screen_running = True
             self.btn_normal_screen.setText("停止屏幕检测")
             self.log("普通检测屏幕检测已开启")
@@ -836,6 +890,18 @@ class YOLOApp(QMainWindow):
             )
             self.normal_screen_label.setPixmap(scaled_pixmap)
 
+            # 计算 FPS
+            self.screen_frame_count += 1
+            current_time = time.time()
+            elapsed = current_time - self.screen_last_time
+            fps = 0
+            if elapsed >= 1.0:
+                fps = self.screen_frame_count / elapsed
+                self.screen_frame_count = 0
+                self.screen_last_time = current_time
+                self.normal_screen_result.setText(f"未检测到目标\n检测速度: {fps:.1f} FPS")
+                return
+
             detections = []
             if len(results[0].boxes) > 0:
                 for i in range(len(results[0].boxes)):
@@ -843,7 +909,9 @@ class YOLOApp(QMainWindow):
                     cls_id = int(results[0].boxes.cls[i].cpu().numpy())
                     cls_name = model_yolo.names[cls_id]
                     detections.append(f"{cls_name} ({conf_val:.2f})")
-            self.normal_screen_result.setText("\n".join(detections) if detections else "未检测到目标")
+            
+            result_text = "\n".join(detections) if detections else "未检测到目标"
+            self.normal_screen_result.setText(result_text)
 
         except Exception as e:
             self.log(f"普通检测屏幕检测错误: {e}")
@@ -918,6 +986,10 @@ class YOLOApp(QMainWindow):
                 QMessageBox.critical(self, "错误", "无法打开摄像头")
                 return
 
+            # 重置 FPS 计数器
+            self.carnum_webcam_frame_count = 0
+            self.carnum_webcam_last_time = time.time()
+            
             self.is_carnum_webcam_running = True
             self.btn_carnum_webcam.setText("关闭摄像头")
             self.log("车牌检测摄像头已开启")
@@ -951,6 +1023,18 @@ class YOLOApp(QMainWindow):
         )
         self.carnum_webcam_label.setPixmap(scaled_pixmap)
 
+        # 计算 FPS
+        self.carnum_webcam_frame_count += 1
+        current_time = time.time()
+        elapsed = current_time - self.carnum_webcam_last_time
+        fps = 0
+        if elapsed >= 1.0:
+            fps = self.carnum_webcam_frame_count / elapsed
+            self.carnum_webcam_frame_count = 0
+            self.carnum_webcam_last_time = current_time
+            self.carnum_webcam_result.setText(f"未检测到目标\n检测速度: {fps:.1f} FPS")
+            return
+
         detections = []
         if len(results[0].boxes) > 0:
             for i in range(len(results[0].boxes)):
@@ -958,7 +1042,9 @@ class YOLOApp(QMainWindow):
                 cls_id = int(results[0].boxes.cls[i].cpu().numpy())
                 cls_name = model_carnum.names[cls_id]
                 detections.append(f"{cls_name} ({conf_val:.2f})")
-        self.carnum_webcam_result.setText("\n".join(detections) if detections else "未检测到目标")
+        
+        result_text = "\n".join(detections) if detections else "未检测到目标"
+        self.carnum_webcam_result.setText(result_text)
 
     # ===== 车牌检测 - 屏幕 =====
     def toggle_carnum_screen(self):
@@ -975,6 +1061,10 @@ class YOLOApp(QMainWindow):
             self.btn_carnum_screen.setText("开启屏幕检测")
             self.log("车牌检测屏幕检测已停止")
         else:
+            # 重置 FPS 计数器
+            self.carnum_screen_frame_count = 0
+            self.carnum_screen_last_time = time.time()
+            
             self.is_carnum_screen_running = True
             self.btn_carnum_screen.setText("停止屏幕检测")
             self.log("车牌检测屏幕检测已开启")
@@ -1008,6 +1098,18 @@ class YOLOApp(QMainWindow):
             )
             self.carnum_screen_label.setPixmap(scaled_pixmap)
 
+            # 计算 FPS
+            self.carnum_screen_frame_count += 1
+            current_time = time.time()
+            elapsed = current_time - self.carnum_screen_last_time
+            fps = 0
+            if elapsed >= 1.0:
+                fps = self.carnum_screen_frame_count / elapsed
+                self.carnum_screen_frame_count = 0
+                self.carnum_screen_last_time = current_time
+                self.carnum_screen_result.setText(f"未检测到目标\n检测速度: {fps:.1f} FPS")
+                return
+
             detections = []
             if len(results[0].boxes) > 0:
                 for i in range(len(results[0].boxes)):
@@ -1015,7 +1117,9 @@ class YOLOApp(QMainWindow):
                     cls_id = int(results[0].boxes.cls[i].cpu().numpy())
                     cls_name = model_carnum.names[cls_id]
                     detections.append(f"{cls_name} ({conf_val:.2f})")
-            self.carnum_screen_result.setText("\n".join(detections) if detections else "未检测到目标")
+            
+            result_text = "\n".join(detections) if detections else "未检测到目标"
+            self.carnum_screen_result.setText(result_text)
 
         except Exception as e:
             self.log(f"车牌检测屏幕检测错误: {e}")

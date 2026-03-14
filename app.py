@@ -2,7 +2,6 @@ import os
 import uuid
 from datetime import datetime
 from pathlib import Path
-
 import cv2
 import mimetypes
 from flask import Flask, request, jsonify, send_file
@@ -11,12 +10,9 @@ from ultralytics import YOLO
 
 # Flask 应用
 def create_flask_app(model_type='yolo'):
-    """创建 Flask 应用
-    
-    Args:
-        model_type: 'yolo' 或 'carnum'，决定使用哪个模型
-    """
+    #创建flask应用
     app = Flask(__name__)
+    #允许跨域
     CORS(app)
 
     app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
@@ -40,7 +36,7 @@ def create_flask_app(model_type='yolo'):
         model_file = 'yolo26x.pt'
 
     model = YOLO(model_file)
-
+    # 检测文件后缀
     def allowed_file(filename, file_type):
         if '.' not in filename:
             return False
@@ -50,7 +46,7 @@ def create_flask_app(model_type='yolo'):
         elif file_type == 'video':
             return ext in ALLOWED_VIDEO_EXTENSIONS
         return False
-
+    #保存上传视频
     def save_uploaded_file(file, file_type):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         unique_id = uuid.uuid4().hex[:8]
@@ -66,7 +62,7 @@ def create_flask_app(model_type='yolo'):
 
         file.save(filepath)
         return filepath, filename
-
+    # 图片检测
     def detect_image(image_path, conf_threshold=0.25):
         img = cv2.imread(image_path)
         results = model(img, conf=conf_threshold)
