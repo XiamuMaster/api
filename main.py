@@ -9,7 +9,6 @@ import uuid
 import subprocess
 import requests
 import torch
-
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
                              QTextEdit, QTabWidget, QMessageBox, QGroupBox,
@@ -616,7 +615,7 @@ class YOLOApp(QMainWindow):
             model_yolo = YOLO('yolo26x.pt')
             model_yolo.to(DEVICE)  # 使用 GPU 加速
             self.log("物品检测模型加载成功!")
-
+            
             self.log("正在加载车牌模型...")
             model_carnum = YOLO('yolo_carnum_best.pt')
             model_carnum.to(DEVICE)  # 使用 GPU 加速

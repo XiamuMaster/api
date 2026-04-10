@@ -4,17 +4,39 @@ from datetime import datetime
 from pathlib import Path
 import cv2
 import mimetypes
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, current_app
 from flask_cors import CORS
 from ultralytics import YOLO
+from flask_sqlalchemy import SQLAlchemy
+
+#初始化数据库
+db = SQLAlchemy()
+
+class DetectionRecord(db.Model):
+    __tablename__ = 'YOLOlist'
+    id = db.Column(db.Integer, primary_key=True)
+    load_filename = db.Column(db.String(255), nullable=False)  # 原文件名
+    result_filename = db.Column(db.String(255))                # 结果文件名
+    model_type = db.Column(db.String(255))                     # 模型类型
+    detect_file_type = db.Column(db.String(255))               # 文件类型
+    create_time = db.Column(db.DateTime, default=datetime.now)
 
 # Flask 应用
 def create_flask_app(model_type='yolo'):
-    #创建flask应用
     app = Flask(__name__)
-    #允许跨域
     CORS(app)
+    app.config['MODEL_TYPE'] = model_type
 
+    #数据库配置
+    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///db.sqlite3'
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    db.init_app(app)
+
+    with app.app_context():
+        db.create_all()
+        print('✅ 数据库表创建完成')
+
+    #flask基础设置
     app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
     UPLOAD_FOLDER = 'uploads'
     RESULT_FOLDER = 'results'
@@ -36,6 +58,7 @@ def create_flask_app(model_type='yolo'):
         model_file = 'yolo26x.pt'
 
     model = YOLO(model_file)
+
     # 检测文件后缀
     def allowed_file(filename, file_type):
         if '.' not in filename:
@@ -46,7 +69,8 @@ def create_flask_app(model_type='yolo'):
         elif file_type == 'video':
             return ext in ALLOWED_VIDEO_EXTENSIONS
         return False
-    #保存上传视频
+
+    #保存上传
     def save_uploaded_file(file, file_type):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         unique_id = uuid.uuid4().hex[:8]
@@ -62,6 +86,7 @@ def create_flask_app(model_type='yolo'):
 
         file.save(filepath)
         return filepath, filename
+
     # 图片检测
     def detect_image(image_path, conf_threshold=0.25):
         img = cv2.imread(image_path)
@@ -112,7 +137,6 @@ def create_flask_app(model_type='yolo'):
         result_path = os.path.join(RESULT_FOLDER, 'videos', filename)
         result_filename = filename
 
-        # 使用 H.264 编码以兼容浏览器播放，添加备选编码
         try:
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
@@ -187,14 +211,32 @@ def create_flask_app(model_type='yolo'):
         try:
             conf = request.form.get('conf', 0.25, type=float)
             detections, result_path, result_filename = detect_image(filepath, conf)
+
+            # ======================
+            # 数据库写入（已修复）
+            # ======================
+            try:
+                current_model = current_app.config['MODEL_TYPE']
+                record = DetectionRecord(
+                    load_filename=filename,
+                    result_filename=result_filename,
+                    model_type=current_model,
+                    detect_file_type='image'
+                )
+                db.session.add(record)
+                db.session.commit()
+                print("✅ 图片记录已保存到数据库")
+            except Exception as db_e:
+                print("❌ 数据库保存失败：", str(db_e))
+                db.session.rollback()
+
             return jsonify({
                 'success': True,
                 'filename': filename,
                 'original_path': filepath,
-                'result_path': result_path,
                 'result_filename': result_filename,
                 'detections': detections,
-                'count': len(detections)
+                'count': len(detections),
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
@@ -215,7 +257,24 @@ def create_flask_app(model_type='yolo'):
             conf = request.form.get('conf', 0.25, type=float)
             detections, result_path, result_filename = detect_video(filepath, conf)
 
-            # 构建视频访问URL
+            # ======================
+            # 数据库写入（已修复）
+            # ======================
+            try:
+                current_model = current_app.config['MODEL_TYPE']
+                record = DetectionRecord(
+                    load_filename=filename,
+                    result_filename=result_filename,
+                    model_type=current_model,
+                    detect_file_type='video'  # 这里修复了！
+                )
+                db.session.add(record)
+                db.session.commit()
+                print("✅ 视频记录已保存到数据库")
+            except Exception as db_e:
+                print("❌ 数据库保存失败：", str(db_e))
+                db.session.rollback()
+
             result_url = f"/api/result/{result_filename}"
 
             return jsonify({
@@ -224,7 +283,6 @@ def create_flask_app(model_type='yolo'):
                 'result_filename': result_filename,
                 'result_url': result_url,
                 'original_path': filepath,
-                'result_path': result_path,
                 'detections': detections,
                 'count': len(detections)
             })
@@ -265,6 +323,50 @@ def create_flask_app(model_type='yolo'):
 
         return send_file(target_path, mimetype=mime_type, as_attachment=False)
 
+    @app.route('/api/resee/<filename>', methods=['GET'])
+    def resee(filename):
+        if not filename:
+            return jsonify({"error": "请传入 filename 参数"}), 400
+        image_path = os.path.join(UPLOAD_FOLDER, 'images', filename)
+        video_path = os.path.join(UPLOAD_FOLDER, 'videos', filename)
+        target_path = None
+        if os.path.exists(image_path):
+            target_path = image_path
+        elif os.path.exists(video_path):
+            target_path = video_path
+        if not target_path:
+            return jsonify({'error': '结果文件不存在'}), 404
+
+        mime_type, _ = mimetypes.guess_type(target_path)
+        if not mime_type:
+            if filename.lower().endswith('.mp4'):
+                mime_type = 'video/mp4'
+            elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
+                mime_type = 'image/jpeg'
+            elif filename.lower().endswith('.png'):
+                mime_type = 'image/png'
+            else:
+                mime_type = 'application/octet-stream'
+
+        return send_file(target_path, mimetype=mime_type, as_attachment=False)
+    @app.route('/api/history/list', methods=['GET'])
+    def get_history():
+        records = DetectionRecord.query.order_by(DetectionRecord.create_time.desc()).limit(20).all()
+        result = []
+        for record in records:
+            result.append({
+                "id": record.id,
+                "fileName": record.load_filename,  # 原文件名
+                "resultFileName": record.result_filename,  # 结果文件名
+                "modelType": record.model_type,  # yolo / carnum
+                "detectFileType": record.detect_file_type,  # image / video
+                "createTime": record.create_time.strftime("%Y-%m-%d %H:%M:%S")
+            })
+
+        return jsonify({
+            "success": True,
+            "list": result
+        })
     @app.route('/api/health', methods=['GET'])
     def health_check():
         return jsonify({
@@ -281,7 +383,7 @@ if __name__ == '__main__':
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     model_type = sys.argv[2] if len(sys.argv) > 2 else 'yolo'
-    
+
     app = create_flask_app(model_type)
     print(f"启动 {model_type} 模型服务，端口: {port}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
