@@ -12,7 +12,8 @@ import torch
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
                              QTextEdit, QTabWidget, QMessageBox, QGroupBox,
-                             QComboBox, QSlider, QProgressBar, QCheckBox)
+                             QComboBox, QSlider, QProgressBar, QCheckBox,
+                             QTableWidget, QTableWidgetItem, QLineEdit, QInputDialog)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QObject, QUrl
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -20,6 +21,24 @@ from PyQt5.QtMultimediaWidgets import QVideoWidget
 
 from ultralytics import YOLO
 from PIL import ImageGrab, Image
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, scoped_session
+
+# 创建数据库
+_engine = create_engine('sqlite:///database/db.sqlite3', connect_args={"check_same_thread": False})
+_session_factory = sessionmaker(bind=_engine)
+
+# 确保 database 目录存在
+os.makedirs('database', exist_ok=True)
+
+# 创建表
+from database.models import User, DetectionRecord
+with _engine.begin() as conn:
+    User.metadata.create_all(conn)
+    DetectionRecord.metadata.create_all(conn)
+
+def _get_session():
+    return scoped_session(_session_factory)
 
 # 全局变量
 flask_thread_yolo = None
@@ -29,7 +48,6 @@ model_carnum = None
 
 # 检测设备
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
 
 # 检测线程 - 通用
 class DetectionThread(QThread):
@@ -303,6 +321,11 @@ class YOLOApp(QMainWindow):
         self.tab_log = QWidget()
         self.tabs.addTab(self.tab_log, "运行日志")
         self.init_log_tab()
+
+        # ===== 用户管理标签页 =====
+        self.tab_user = QWidget()
+        self.tabs.addTab(self.tab_user, "用户管理")
+        self.init_user_tab()
 
         self.statusBar().showMessage("就绪")
 
@@ -597,6 +620,236 @@ class YOLOApp(QMainWindow):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
 
+
+    def init_user_tab(self):
+        layout = QVBoxLayout()
+
+        # ---- 顶部：添加用户 ----
+        add_group = QGroupBox("添加用户")
+        add_layout = QHBoxLayout()
+
+        self.user_add_username = QLineEdit()
+        self.user_add_username.setPlaceholderText("用户名")
+        add_layout.addWidget(self.user_add_username)
+
+        self.user_add_password = QLineEdit()
+        self.user_add_password.setPlaceholderText("密码")
+        self.user_add_password.setEchoMode(QLineEdit.Password)
+        add_layout.addWidget(self.user_add_password)
+
+        self.user_add_role = QComboBox()
+        self.user_add_role.addItems(['user', 'admin', 'super_admin'])
+        add_layout.addWidget(self.user_add_role)
+
+        btn_add_user = QPushButton("添加")
+        btn_add_user.clicked.connect(self.do_add_user)
+        add_layout.addWidget(btn_add_user)
+
+        add_group.setLayout(add_layout)
+        layout.addWidget(add_group)
+
+        # ---- 中部：用户列表表格 ----
+        self.user_table = QTableWidget()
+        self.user_table.setColumnCount(6)
+        self.user_table.setHorizontalHeaderLabels(['ID', '用户名', '角色', '状态', '注册时间', '最后使用'])
+        self.user_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.user_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.user_table.horizontalHeader().setStretchLastSection(True)
+        self.user_table.setColumnWidth(0, 50)   # ID
+        self.user_table.setColumnWidth(1, 120)  # 用户名
+        self.user_table.setColumnWidth(2, 80)   # 角色
+        self.user_table.setColumnWidth(3, 60)   # 状态
+        self.user_table.setColumnWidth(4, 140)  # 注册时间
+        self.user_table.setColumnWidth(5, 140)  # 最后使用
+        self.user_table.setMinimumHeight(300)
+        layout.addWidget(self.user_table)
+
+        # ---- 底部：操作按钮 ----
+        btn_layout = QHBoxLayout()
+
+        btn_refresh = QPushButton("刷新列表")
+        btn_refresh.clicked.connect(self.refresh_user_table)
+        btn_layout.addWidget(btn_refresh)
+
+        btn_change_role = QPushButton("修改角色")
+        btn_change_role.clicked.connect(self.do_change_role)
+        btn_layout.addWidget(btn_change_role)
+
+        btn_toggle_status = QPushButton("启用/禁用")
+        btn_toggle_status.clicked.connect(self.do_toggle_status)
+        btn_layout.addWidget(btn_toggle_status)
+
+        btn_delete_user = QPushButton("删除用户")
+        btn_delete_user.clicked.connect(self.do_delete_user)
+        btn_layout.addWidget(btn_delete_user)
+
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        self.tab_user.setLayout(layout)
+        self.refresh_user_table()
+
+    def refresh_user_table(self):
+        from database.models import User
+        try:
+            session = _get_session()
+            users = session.query(User).order_by(User.id).all()
+            self.user_table.setRowCount(0)
+            for user in users:
+                row = self.user_table.rowCount()
+                self.user_table.insertRow(row)
+                self.user_table.setItem(row, 0, QTableWidgetItem(str(user.id)))
+                self.user_table.setItem(row, 1, QTableWidgetItem(user.username))
+                self.user_table.setItem(row, 2, QTableWidgetItem(user.role))
+                status_text = '启用' if user.is_active else '禁用'
+                self.user_table.setItem(row, 3, QTableWidgetItem(status_text))
+                self.user_table.setItem(row, 4, QTableWidgetItem(user.create_time.strftime('%Y-%m-%d %H:%M:%S')))
+                last_login_text = user.last_login.strftime('%Y-%m-%d %H:%M:%S') if user.last_login else '从未登录'
+                self.user_table.setItem(row, 5, QTableWidgetItem(last_login_text))
+            session.remove()
+            self.log(f"用户列表已刷新，共 {len(users)} 条")
+        except Exception as e:
+            self.log(f"刷新用户列表失败: {e}")
+
+    def get_selected_user_id(self):
+        selected = self.user_table.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "提示", "请先选中一行")
+            return None
+        return int(selected[0].text())
+
+    def do_add_user(self):
+        from database.models import User
+        from database import hash_password, ROLE_USER, ROLE_ADMIN, ROLE_SUPER_ADMIN
+        username = self.user_add_username.text().strip()
+        password = self.user_add_password.text().strip()
+        role = self.user_add_role.currentText()
+
+        if not username or not password:
+            QMessageBox.warning(self, "提示", "用户名和密码不能为空")
+            return
+        if len(password) < 6:
+            QMessageBox.warning(self, "提示", "密码长度不能少于 6 位")
+            return
+
+        session = _get_session()
+        existing = session.query(User).filter_by(username=username).first()
+        if existing:
+            session.remove()
+            QMessageBox.warning(self, "提示", "用户名已存在")
+            return
+
+        try:
+            role_map = {'user': ROLE_USER, 'admin': ROLE_ADMIN, 'super_admin': ROLE_SUPER_ADMIN}
+            new_user = User(
+                username=username,
+                password=hash_password(password),
+                role=role_map[role],
+                is_active=True,
+            )
+            session.add(new_user)
+            session.commit()
+            session.remove()
+            self.user_add_username.clear()
+            self.user_add_password.clear()
+            self.refresh_user_table()
+            self.log(f"用户 {username}（角色：{role}）添加成功")
+        except Exception as e:
+            session.rollback()
+            session.remove()
+            QMessageBox.critical(self, "错误", f"添加失败: {e}")
+
+    def do_change_role(self):
+        from database.models import User
+        from database import ROLE_USER, ROLE_ADMIN, ROLE_SUPER_ADMIN
+        user_id = self.get_selected_user_id()
+        if user_id is None:
+            return
+
+        role_map = {'user': ROLE_USER, 'admin': ROLE_ADMIN, 'super_admin': ROLE_SUPER_ADMIN}
+        role_names = list(role_map.keys())
+        role_text, ok = QInputDialog.getItem(self, "修改角色", "选择新角色：", role_names, 0, False)
+        if not ok:
+            return
+
+        session = _get_session()
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user:
+            session.remove()
+            QMessageBox.warning(self, "提示", "用户不存在")
+            return
+
+        try:
+            old_role = user.role
+            user.role = role_map[role_text]
+            session.commit()
+            session.remove()
+            self.refresh_user_table()
+            self.log(f"用户 {user.username} 角色已从 {old_role} 改为 {role_text}")
+        except Exception as e:
+            session.rollback()
+            session.remove()
+            QMessageBox.critical(self, "错误", f"修改失败: {e}")
+
+    def do_toggle_status(self):
+        from database.models import User
+        user_id = self.get_selected_user_id()
+        if user_id is None:
+            return
+
+        session = _get_session()
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user:
+            session.remove()
+            QMessageBox.warning(self, "提示", "用户不存在")
+            return
+
+        new_status = not user.is_active
+        try:
+            user.is_active = new_status
+            session.commit()
+            status_str = '启用' if new_status else '禁用'
+            session.remove()
+            self.refresh_user_table()
+            self.log(f"用户 {user.username} 已{status_str}")
+        except Exception as e:
+            session.rollback()
+            session.remove()
+            QMessageBox.critical(self, "错误", f"操作失败: {e}")
+
+    def do_delete_user(self):
+        from database.models import User
+        user_id = self.get_selected_user_id()
+        if user_id is None:
+            return
+
+        session = _get_session()
+        user = session.query(User).filter_by(id=user_id).first()
+        if not user:
+            session.remove()
+            QMessageBox.warning(self, "提示", "用户不存在")
+            return
+
+        username = user.username
+        reply = QMessageBox.question(
+            self, "确认删除", f"确定删除用户「{username}」（ID={user_id}）吗？\n此操作不可恢复！",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            session.remove()
+            return
+
+        try:
+            session.delete(user)
+            session.commit()
+            session.remove()
+            self.refresh_user_table()
+            self.log(f"用户 {username} 已删除")
+        except Exception as e:
+            session.rollback()
+            session.remove()
+            QMessageBox.critical(self, "错误", f"删除失败: {e}")
+
     def start_flask(self):
         global flask_thread_yolo, flask_thread_carnum, model_yolo, model_carnum
 
@@ -654,7 +907,7 @@ class YOLOApp(QMainWindow):
             )
 
         if not file_path:
-            return
+            return 
 
         conf = self.conf_slider.value() / 100
         self.log(f"开始检测: {os.path.basename(file_path)}")
@@ -752,7 +1005,7 @@ class YOLOApp(QMainWindow):
         self.log(f"检测错误: {error}")
         QMessageBox.critical(self, "错误", f"检测失败: {error}")
 
-    # ===== 普通检测 - 摄像头 =====
+    # 普通检测摄像头
     def toggle_normal_webcam(self):
         global model_yolo
 
@@ -837,7 +1090,7 @@ class YOLOApp(QMainWindow):
         result_text = "\n".join(detections) if detections else "未检测到目标"
         self.normal_webcam_result.setText(result_text)
 
-    # ===== 普通检测 - 屏幕 =====
+    #屏幕检测普通
     def toggle_normal_screen(self):
         global model_yolo
 

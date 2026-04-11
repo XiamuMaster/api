@@ -1,127 +1,235 @@
-YOLO 检测 API 后端
-功能特性
-支持图片上传和检测
-支持视频上传和检测
-自动保存原始文件和标注后的文件
-返回详细的检测结果（类别、置信度、边界框坐标）
-目录结构
-Claw/
-├── app.py              # 主程序
-├── requirements.txt    # 依赖包
-├── yolov6n.pt         # YOLO 模型文件
-├── uploads/            # 上传文件存储
-│   ├── images/
-│   └── videos/
-└── results/           # 检测结果存储
-    ├── images/
-    └── videos/
-安装步骤
-1. 安装依赖
-bash
-复制
+# YOLO 目标检测系统
+
+基于 PyQt5 + Flask + YOLO 的目标检测系统，支持普通目标检测和车牌检测两种模式。
+
+## 功能特性
+
+### 检测模式
+- **普通检测**：通用目标检测（端口 5000）
+- **车牌检测**：车牌识别专用模型（端口 5001）
+
+### 支持的检测方式
+- 图片上传检测
+- 视频上传检测
+- 屏幕实时检测（PyQt5 界面）
+- 摄像头实时检测
+
+### 用户权限系统
+- **超级管理员 (super_admin)**：查看所有用户的检测记录，删除任意记录
+- **管理员 (admin)**：仅查看和删除自己的检测记录
+- **普通用户 (user)**：仅查看和删除自己的检测记录
+
+### 其他功能
+- JWT Token 认证（48小时有效期）
+- 检测历史记录管理
+- 原图与检测结果对比查看
+
+## 目录结构
+
+```
+yoloapi/
+├── main.py                  # PyQt5 主界面程序
+├── app.py                   # Flask API 后端
+├── database/                # 数据库包
+│   ├── __init__.py
+│   ├── models.py            # 数据模型
+│   ├── crud.py              # 数据库操作
+│   └── db.sqlite3           # SQLite 数据库文件
+├── static/                  # 静态文件
+│   └── uploads/             # 上传文件
+│   └── results/             # 检测结果
+├── yolo26x.pt               # 普通目标检测模型
+├── yolo_carnum_best.pt      # 车牌检测模型
+└── requirements.txt         # 依赖包
+```
+
+## 安装步骤
+
+### 1. 创建虚拟环境（推荐）
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate  # Windows
+# source .venv/bin/activate  # Linux/Mac
+```
+
+### 2. 安装依赖
+
+```bash
 pip install -r requirements.txt
-2. 准备模型
-将训练好的 YOLO 模型放在项目根目录，命名为 yolov6n.pt
+```
 
-或者使用官方模型：
+### 3. 准备模型文件
 
-bash
-复制
-# 首次运行会自动下载
-python app.py
-运行服务
-bash
-复制
-python app.py
-服务启动后运行在：http://127.0.0.1:5000
+将 YOLO 模型文件放在项目根目录：
+- `yolo26x.pt` - 普通目标检测模型
+- `yolo_carnum_best.pt` - 车牌检测模型
 
-API 接口
-1. 健康检查
-GET /api/health
-响应：
+## 运行方式
 
-json
-复制
+### 启动主程序
+
+```bash
+python main.py
+```
+
+这将启动 PyQt5 桌面界面，包含：
+- 模式切换（普通检测 / 车牌检测）
+- 文件上传检测
+- 屏幕实时检测
+- 历史记录管理
+- 用户管理（超级管理员）
+
+### 单独启动 Flask API
+
+```bash
+# 普通检测模式（端口 5000）
+python app.py yolo
+
+# 车牌检测模式（端口 5001）
+python app.py carnum
+```
+
+## API 接口
+
+> 所有需要认证的接口需要在 Header 中携带 Token：
+> ```
+> Authorization: Bearer <token>
+> ```
+
+### 认证接口
+
+#### 登录
+```
+POST /api/auth/login
+Content-Type: application/json
+
 {
-  "status": "ok",
-  "model": "yolov6n.pt",
-  "timestamp": "2026-03-10T10:30:00"
+  "username": "admin",
+  "password": "admin123"
 }
-2. 图片检测
+```
+
+#### 登出
+```
+POST /api/auth/logout
+Authorization: Bearer <token>
+```
+
+### 检测接口
+
+#### 图片检测
+```
 POST /api/detect/image
-参数：
+Authorization: Bearer <token>
+Content-Type: multipart/form-data
 
-file: 图片文件（multipart/form-data）
+file: 图片文件
 conf: 置信度阈值（可选，默认 0.25）
-请求示例：
+```
 
-bash
-复制
-curl -X POST http://127.0.0.1:5000/api/detect/image \
-  -F "file=@test.jpg" \
-  -F "conf=0.5"
-响应示例：
-
-json
-复制
-3. 视频检测
+#### 视频检测
+```
 POST /api/detect/video
-参数：
+Authorization: Bearer <token>
+Content-Type: multipart/form-data
 
-file: 视频文件（multipart/form-data）
+file: 视频文件
 conf: 置信度阈值（可选，默认 0.25）
-请求示例：
+```
 
-bash
-复制
-curl -X POST http://127.0.0.1:5000/api/detect/video \
-  -F "file=@test.mp4" \
-  -F "conf=0.5"
+### 历史记录接口
+
+#### 查询历史
+```
+GET /api/history/list?limit=100
+Authorization: Bearer <token>
+```
+
 响应示例：
+```json
+{
+  "records": [
+    {
+      "id": 1,
+      "load_filename": "img_xxx.jpg",
+      "result_filename": "result_xxx.jpg",
+      "detect_file_type": "image",
+      "create_time": "2026-04-11T12:00:00",
+      "user_id": 1
+    }
+  ]
+}
+```
 
-json
-复制
-4. 获取结果文件
-GET /api/result/<filename>
-请求示例：
+#### 删除记录
+```
+GET /api/history/delete/<id>
+Authorization: Bearer <token>
+```
 
-bash
-复制
-# 获取标注后的图片
-curl http://127.0.0.1:5000/api/result/img_20260310_103000_a1b2c3d4_annotated.jpg
+#### 查看原图/结果
+```
+GET /api/resee/<id>
+Authorization: Bearer <token>
+```
 
-# 获取标注后的视频
-curl http://127.0.0.1:5000/api/result/vid_20260310_103000_a1b2c3d4_annotated.mp4 -o output.mp4
-支持的格式
-图片格式
-JPG / JPEG
-PNG
-BMP
-WebP
-视频格式
-MP4
-AVI
-MOV
-MKV
-FLV
-前端集成示例
-JavaScript / Fetch
-javascript
-复制
-Python / Requests
-python
-复制
-注意事项
-文件大小限制：最大支持 500MB
-视频处理时间：视频检测可能需要较长时间，请耐心等待
-GPU 加速：如果有 NVIDIA GPU，会自动使用 CUDA 加速
-内存占用：处理大视频时需要足够的内存
-故障排除
-模型加载失败
-确保 yolov6n.pt 文件在项目根目录
+### 其他接口
 
-CORS 错误
-API 已配置 CORS，前端可直接跨域访问
+#### 健康检查
+```
+GET /api/health
+```
 
-视频处理失败
-检查视频格式和编码是否被 OpenCV 支持
+## 默认账号
+
+| 用户名 | 密码 | 角色 |
+|--------|------|------|
+| admin | admin123 | super_admin |
+| user1 | user123 | user |
+| admin2 | admin123 | admin |
+
+> 首次启动服务时自动创建超级管理员账号
+
+## 文件格式支持
+
+### 图片格式
+- JPG / JPEG
+- PNG
+- BMP
+- WebP
+
+### 视频格式
+- MP4
+- AVI
+- MOV
+- MKV
+- FLV
+
+## 配置说明
+
+### 数据库
+- 路径：`database/db.sqlite3`
+- 类型：SQLite
+
+### 文件存储
+- 上传文件：`static/uploads/images/` 和 `static/uploads/videos/`
+- 检测结果：`static/results/images/` 和 `static/results/videos/`
+
+### 文件大小限制
+- 最大支持 500MB
+
+## 技术栈
+
+- **后端**：Flask + Flask-CORS + Flask-SQLAlchemy
+- **前端界面**：PyQt5
+- **目标检测**：Ultralytics YOLO
+- **认证**：PyJWT
+- **数据库**：SQLite + SQLAlchemy
+
+## 注意事项
+
+1. **GPU 加速**：如果有 NVIDIA GPU，系统会自动使用 CUDA 加速
+2. **内存占用**：处理大视频时需要足够的内存
+3. **Token 刷新**：Token 过期后需要重新登录
+4. **删除操作**：删除记录会同时删除原始文件和结果文件

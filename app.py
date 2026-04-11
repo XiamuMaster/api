@@ -1,65 +1,96 @@
 import os
+import sys
 import uuid
-from datetime import datetime
-from pathlib import Path
-import cv2
+import jwt
 import mimetypes
-from flask import Flask, request, jsonify, send_file, current_app
+from datetime import datetime, timedelta,timezone
+from functools import wraps
+from pathlib import Path
+
+import cv2
+from flask import Flask, request, jsonify, send_file, current_app, url_for
 from flask_cors import CORS
 from ultralytics import YOLO
-from flask_sqlalchemy import SQLAlchemy
 
-#初始化数据库
-db = SQLAlchemy()
+from database import (
+    db,
+    User, DetectionRecord,
+    ROLE_USER, ROLE_ADMIN, ROLE_SUPER_ADMIN,
+    hash_password,
+    get_user_by_username, get_user_by_id,
+    create_user, update_user_last_login,
+    save_detection_record, get_history_list,
+    get_record_by_id, delete_record_by_id,
+)
 
-class DetectionRecord(db.Model):
-    __tablename__ = 'YOLOlist'
-    id = db.Column(db.Integer, primary_key=True)
-    load_filename = db.Column(db.String(255), nullable=False)  # 原文件名
-    result_filename = db.Column(db.String(255))                # 结果文件名
-    model_type = db.Column(db.String(255))                     # 模型类型
-    detect_file_type = db.Column(db.String(255))               # 文件类型
-    create_time = db.Column(db.DateTime, default=datetime.now)
 
-# Flask 应用
 def create_flask_app(model_type='yolo'):
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder='static', static_url_path='/static')
     CORS(app)
     app.config['MODEL_TYPE'] = model_type
 
-    #数据库配置
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///db.sqlite3'
+    # 数据库配置 - 使用绝对路径
+    basedir = os.path.abspath(os.path.dirname(__file__))
+    db_path = os.path.join(basedir, 'database', 'db.sqlite3')
+    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    # JWT 配置
+    app.config['JWT_SECRET_KEY'] = 'yolo_flask_jwt_secret_key_2026_yolo_api'  # 至少32字节
+    app.config['JWT_EXPIRE_HOURS'] = 48               #token有效期
     db.init_app(app)
 
     with app.app_context():
         db.create_all()
-        print('✅ 数据库表创建完成')
 
-    #flask基础设置
+    # 基础设置 - 使用绝对路径
     app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
-    UPLOAD_FOLDER = 'uploads'
-    RESULT_FOLDER = 'results'
+    UPLOAD_FOLDER = os.path.join(basedir, 'static', 'uploads')
+    RESULT_FOLDER = os.path.join(basedir, 'static', 'results')
 
-    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-    os.makedirs(RESULT_FOLDER, exist_ok=True)
-    os.makedirs(os.path.join(UPLOAD_FOLDER, 'images'), exist_ok=True)
-    os.makedirs(os.path.join(UPLOAD_FOLDER, 'videos'), exist_ok=True)
-    os.makedirs(os.path.join(RESULT_FOLDER, 'images'), exist_ok=True)
-    os.makedirs(os.path.join(RESULT_FOLDER, 'videos'), exist_ok=True)
+    #创建文件夹
+    for sub in ['images', 'videos']:
+        os.makedirs(os.path.join(UPLOAD_FOLDER, sub), exist_ok=True)
+        os.makedirs(os.path.join(RESULT_FOLDER, sub), exist_ok=True)
 
+    #文件类型筛选
     ALLOWED_IMAGE_EXTENSIONS = {'png', 'jpg', 'jpeg', 'bmp', 'webp'}
     ALLOWED_VIDEO_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv', 'flv'}
 
-    # 根据模型类型选择模型文件
-    if model_type == 'carnum':
-        model_file = 'yolo_carnum_best.pt'
-    else:
-        model_file = 'yolo26x.pt'
+    #根据JWT创建token
+    def generate_token(user_id, role):
+        payload = {
+            'user_id': user_id,
+            'role':    role,
+            'exp':     datetime.now(timezone.utc) + timedelta(hours=app.config['JWT_EXPIRE_HOURS']),
+            'iat':     datetime.now(timezone.utc),
+        }
+        return jwt.encode(payload, app.config['JWT_SECRET_KEY'], algorithm='HS256')
+    #解码token
+    def decode_token(token):
+        return jwt.decode(token, app.config['JWT_SECRET_KEY'], algorithms=['HS256'])
+    #token登录验证
+    def login_required(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            auth_header = request.headers.get('Authorization', '')
+            if not auth_header.startswith('Bearer '):
+                return jsonify({'error': '未登录，请先登录'}), 401
+            token = auth_header.split(' ', 1)[1]
+            try:
+                payload = decode_token(token)
+            except jwt.ExpiredSignatureError:
+                return jsonify({'error': 'Token 已过期，请重新登录'}), 401
+            except jwt.InvalidTokenError:
+                return jsonify({'error': 'Token 无效'}), 401
+            user = get_user_by_id(payload['user_id'])
+            if not user:
+                return jsonify({'error': '账号不存在'}), 403
+            request.current_user = user
+            request.current_token = token
+            return f(*args, **kwargs)
+        return decorated
 
-    model = YOLO(model_file)
-
-    # 检测文件后缀
+    #文件校验
     def allowed_file(filename, file_type):
         if '.' not in filename:
             return False
@@ -69,134 +100,122 @@ def create_flask_app(model_type='yolo'):
         elif file_type == 'video':
             return ext in ALLOWED_VIDEO_EXTENSIONS
         return False
-
-    #保存上传
+    #文件保存
     def save_uploaded_file(file, file_type):
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         unique_id = uuid.uuid4().hex[:8]
-
+        ext = file.filename.rsplit('.', 1)[1].lower()
         if file_type == 'image':
-            ext = file.filename.rsplit('.', 1)[1].lower()
             filename = f'img_{timestamp}_{unique_id}.{ext}'
             filepath = os.path.join(UPLOAD_FOLDER, 'images', filename)
         else:
-            ext = file.filename.rsplit('.', 1)[1].lower()
             filename = f'vid_{timestamp}_{unique_id}.{ext}'
             filepath = os.path.join(UPLOAD_FOLDER, 'videos', filename)
-
         file.save(filepath)
         return filepath, filename
 
-    # 图片检测
+    if model_type == 'carnum':
+        model_file = 'yolo_carnum_best.pt'
+    else:
+        model_file = 'yolo26x.pt'
+    model = YOLO(model_file)
+    #图片检测方法
     def detect_image(image_path, conf_threshold=0.25):
         img = cv2.imread(image_path)
         results = model(img, conf=conf_threshold)
-
         detections = []
         result_img = results[0].plot()
-
         for result in results[0]:
             box = result.boxes
             if len(box) > 0:
                 x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                 conf = box.conf[0].cpu().numpy()
                 cls_id = int(box.cls[0].cpu().numpy())
-                cls_name = model.names[cls_id]
-                detection = {
-                    'class': cls_name,
-                    'class_id': cls_id,
+                detections.append({
+                    'class':      model.names[cls_id],
+                    'class_id':   cls_id,
                     'confidence': float(conf),
-                    'bbox': {
-                        'x1': float(x1), 'y1': float(y1),
-                        'x2': float(x2), 'y2': float(y2)
-                    }
-                }
-                detections.append(detection)
-
+                    'bbox': {'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2)}
+                })
         filename = Path(image_path).stem + '_annotated.jpg'
         result_path = os.path.join(RESULT_FOLDER, 'images', filename)
-        result_filename = filename
         cv2.imwrite(result_path, result_img)
-
-        return detections, result_path, result_filename
-
+        return detections, result_path, filename
+    #视频检测方法
     def detect_video(video_path, conf_threshold=0.25):
         cap = cv2.VideoCapture(video_path)
-
         if not cap.isOpened():
             raise ValueError(f"无法打开视频: {video_path}")
-
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fps    = int(cap.get(cv2.CAP_PROP_FPS)) or 30
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        if fps == 0:
-            fps = 30
-
-        filename = Path(video_path).stem + '_annotated.mp4'
-        result_path = os.path.join(RESULT_FOLDER, 'videos', filename)
-        result_filename = filename
+        filename     = Path(video_path).stem + '_annotated.mp4'
+        result_path  = os.path.join(RESULT_FOLDER, 'videos', filename)
 
         try:
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
             if not out.isOpened():
-                raise Exception("avc1编码器无法打开")
-        except Exception as e:
-            print(f"avc1编码失败，尝试XVID: {e}")
-            try:
-                fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                out = cv2.VideoWriter(result_path.replace('.mp4', '.avi'), fourcc, fps, (width, height))
-                result_filename = result_filename.replace('.mp4', '.avi')
-                result_path = result_path.replace('.mp4', '.avi')
-            except:
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
+                raise Exception("avc1 编码器无法打开")
+        except Exception:
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            filename    = filename.replace('.mp4', '.avi')
+            result_path = result_path.replace('.mp4', '.avi')
+            out = cv2.VideoWriter(result_path, fourcc, fps, (width, height))
 
-        all_detections = []
-        frame_count = 0
+        all_detections  = []
+        frame_count     = 0
         detect_interval = max(1, int(fps / 5))
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-
             results = model(frame, conf=conf_threshold)
-
-            current_frame_detections = []
-            if len(results[0].boxes) > 0:
+            if frame_count % detect_interval == 0 and len(results[0].boxes) > 0:
                 for i in range(len(results[0].boxes)):
                     x1, y1, x2, y2 = results[0].boxes.xyxy[i].cpu().numpy()
                     conf_val = results[0].boxes.conf[i].cpu().numpy()
-                    cls_id = int(results[0].boxes.cls[i].cpu().numpy())
-                    cls_name = model.names[cls_id]
-
-                    detection = {
-                        'frame': frame_count,
-                        'class': cls_name,
-                        'class_id': cls_id,
+                    cls_id   = int(results[0].boxes.cls[i].cpu().numpy())
+                    all_detections.append({
+                        'frame':      frame_count,
+                        'class':      model.names[cls_id],
+                        'class_id':   cls_id,
                         'confidence': float(conf_val),
-                        'bbox': {
-                            'x1': float(x1), 'y1': float(y1),
-                            'x2': float(x2), 'y2': float(y2)
-                        }
-                    }
-                    current_frame_detections.append(detection)
-
-            if frame_count % detect_interval == 0:
-                all_detections.extend(current_frame_detections)
-
-            annotated_frame = results[0].plot()
-            out.write(annotated_frame)
+                        'bbox': {'x1': float(x1), 'y1': float(y1), 'x2': float(x2), 'y2': float(y2)}
+                    })
+            out.write(results[0].plot())
             frame_count += 1
 
         cap.release()
         out.release()
+        return all_detections, result_path, filename
 
-        return all_detections, result_path, result_filename
 
+    #用户登录
+    @app.route('/api/user/login', methods=['POST'])
+    def login():
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': '请求体不能为空'}), 400
+        username = data.get('username', '').strip()
+        password = data.get('password', '').strip()
+        if not username or not password:
+            return jsonify({'error': '用户名和密码不能为空'}), 400
+        user = get_user_by_username(username)
+        if not user or user.password != hash_password(password):
+            return jsonify({'error': '用户名或密码错误'}), 401
+        if not user.is_active:
+            return jsonify({'error': '账号已被禁用'}), 403
+        update_user_last_login(user)
+        token = generate_token(user.id, user.role)
+        return jsonify({'success': True, 'message': '登录成功', 'token': token, 'user': user.to_dict()})
+
+
+    #图片检测api
     @app.route('/api/detect/image', methods=['POST'])
+    @login_required
     def detect_image_api():
         if 'file' not in request.files:
             return jsonify({'error': '没有上传文件'}), 400
@@ -205,43 +224,33 @@ def create_flask_app(model_type='yolo'):
             return jsonify({'error': '文件名为空'}), 400
         if not allowed_file(file.filename, 'image'):
             return jsonify({'error': '不支持的图片格式'}), 400
-
         filepath, filename = save_uploaded_file(file, 'image')
-
         try:
             conf = request.form.get('conf', 0.25, type=float)
             detections, result_path, result_filename = detect_image(filepath, conf)
-
-            # ======================
-            # 数据库写入（已修复）
-            # ======================
             try:
-                current_model = current_app.config['MODEL_TYPE']
-                record = DetectionRecord(
-                    load_filename=filename,
-                    result_filename=result_filename,
-                    model_type=current_model,
-                    detect_file_type='image'
+                # 保存检测记录时传入用户ID
+                save_detection_record(
+                    filename, result_filename,
+                    current_app.config['MODEL_TYPE'], 'image',
+                    user_id=request.current_user.id
                 )
-                db.session.add(record)
-                db.session.commit()
-                print("✅ 图片记录已保存到数据库")
+                print(f"✅ 图片记录已保存到数据库 (user_id={request.current_user.id})")
             except Exception as db_e:
                 print("❌ 数据库保存失败：", str(db_e))
-                db.session.rollback()
-
             return jsonify({
-                'success': True,
-                'filename': filename,
-                'original_path': filepath,
+                'success':         True,
+                'filename':        filename,
+                'original_path':   filepath,
                 'result_filename': result_filename,
-                'detections': detections,
-                'count': len(detections),
+                'detections':      detections,
+                'count':           len(detections),
             })
         except Exception as e:
             return jsonify({'error': str(e)}), 500
-
+    #视频检测api
     @app.route('/api/detect/video', methods=['POST'])
+    @login_required
     def detect_video_api():
         if 'file' not in request.files:
             return jsonify({'error': '没有上传文件'}), 400
@@ -250,140 +259,154 @@ def create_flask_app(model_type='yolo'):
             return jsonify({'error': '文件名为空'}), 400
         if not allowed_file(file.filename, 'video'):
             return jsonify({'error': '不支持的视频格式'}), 400
-
         filepath, filename = save_uploaded_file(file, 'video')
-
         try:
             conf = request.form.get('conf', 0.25, type=float)
             detections, result_path, result_filename = detect_video(filepath, conf)
-
-            # ======================
-            # 数据库写入（已修复）
-            # ======================
             try:
-                current_model = current_app.config['MODEL_TYPE']
-                record = DetectionRecord(
-                    load_filename=filename,
-                    result_filename=result_filename,
-                    model_type=current_model,
-                    detect_file_type='video'  # 这里修复了！
+                # 保存检测记录时传入用户ID
+                save_detection_record(
+                    filename, result_filename,
+                    current_app.config['MODEL_TYPE'], 'video',
+                    user_id=request.current_user.id
                 )
-                db.session.add(record)
-                db.session.commit()
-                print("✅ 视频记录已保存到数据库")
+                print(f"✅ 视频记录已保存到数据库 (user_id={request.current_user.id})")
             except Exception as db_e:
                 print("❌ 数据库保存失败：", str(db_e))
-                db.session.rollback()
-
-            result_url = f"/api/result/{result_filename}"
-
             return jsonify({
-                'success': True,
-                'filename': filename,
+                'success':         True,
+                'filename':        filename,
                 'result_filename': result_filename,
-                'result_url': result_url,
-                'original_path': filepath,
-                'detections': detections,
-                'count': len(detections)
+                'result_url':      f'/api/result/{result_filename}',
+                'original_path':   filepath,
+                'detections':      detections,
+                'count':           len(detections),
             })
         except Exception as e:
             import traceback
             traceback.print_exc()
             return jsonify({'error': str(e)}), 500
 
+
+    #图片查询api
     @app.route('/api/result/<filename>', methods=['GET'])
     def get_result(filename):
         if '/' in filename or '\\' in filename:
             return jsonify({'error': '非法的文件名'}), 400
-
         image_path = os.path.join(RESULT_FOLDER, 'images', filename)
         video_path = os.path.join(RESULT_FOLDER, 'videos', filename)
-
-        target_path = None
-
-        if os.path.exists(image_path):
-            target_path = image_path
-        elif os.path.exists(video_path):
-            target_path = video_path
-
+        target_path = image_path if os.path.exists(image_path) else (
+            video_path if os.path.exists(video_path) else None
+        )
         if not target_path:
             return jsonify({'error': '结果文件不存在'}), 404
-
-        mime_type, _ = mimetypes.guess_type(target_path)
-
-        if not mime_type:
-            if filename.lower().endswith('.mp4'):
-                mime_type = 'video/mp4'
-            elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
-                mime_type = 'image/jpeg'
-            elif filename.lower().endswith('.png'):
-                mime_type = 'image/png'
-            else:
-                mime_type = 'application/octet-stream'
-
-        return send_file(target_path, mimetype=mime_type, as_attachment=False)
-
-    @app.route('/api/resee/<filename>', methods=['GET'])
-    def resee(filename):
-        if not filename:
-            return jsonify({"error": "请传入 filename 参数"}), 400
-        image_path = os.path.join(UPLOAD_FOLDER, 'images', filename)
-        video_path = os.path.join(UPLOAD_FOLDER, 'videos', filename)
-        target_path = None
-        if os.path.exists(image_path):
-            target_path = image_path
-        elif os.path.exists(video_path):
-            target_path = video_path
-        if not target_path:
-            return jsonify({'error': '结果文件不存在'}), 404
-
         mime_type, _ = mimetypes.guess_type(target_path)
         if not mime_type:
-            if filename.lower().endswith('.mp4'):
-                mime_type = 'video/mp4'
-            elif filename.lower().endswith('.jpg') or filename.lower().endswith('.jpeg'):
-                mime_type = 'image/jpeg'
-            elif filename.lower().endswith('.png'):
-                mime_type = 'image/png'
-            else:
-                mime_type = 'application/octet-stream'
-
+            ext = filename.lower().rsplit('.', 1)[-1]
+            mime_type = {'mp4': 'video/mp4', 'jpg': 'image/jpeg',
+                         'jpeg': 'image/jpeg', 'png': 'image/png'}.get(ext, 'application/octet-stream')
         return send_file(target_path, mimetype=mime_type, as_attachment=False)
-    @app.route('/api/history/list', methods=['GET'])
-    def get_history():
-        records = DetectionRecord.query.order_by(DetectionRecord.create_time.desc()).limit(20).all()
-        result = []
-        for record in records:
-            result.append({
-                "id": record.id,
-                "fileName": record.load_filename,  # 原文件名
-                "resultFileName": record.result_filename,  # 结果文件名
-                "modelType": record.model_type,  # yolo / carnum
-                "detectFileType": record.detect_file_type,  # image / video
-                "createTime": record.create_time.strftime("%Y-%m-%d %H:%M:%S")
+    #历史界面图片查询api
+    @app.route('/api/resee/<int:id>', methods=['GET'])
+    @login_required
+    def resee(id):
+        """查看检测结果，普通用户/管理员只能查看自己的记录"""
+        record = get_record_by_id(id)
+        if not record:
+            return jsonify({'error': '当前记录不存在'}), 400
+
+        # 权限检查：普通用户和管理员只能查看自己的记录
+        user = request.current_user
+        if user.role != ROLE_SUPER_ADMIN and record.user_id != user.id:
+            return jsonify({'error': '无权限查看他人的检测记录'}), 403
+
+        if record.detect_file_type == 'image':
+            upload_path = os.path.join(UPLOAD_FOLDER, 'images', record.load_filename)
+            result_path = os.path.join(RESULT_FOLDER, 'images', record.result_filename)
+            if not os.path.exists(upload_path) or not os.path.exists(result_path):
+                return jsonify({'error': '文件已丢失'}), 400
+            return jsonify({
+                'code':     200,
+                'original': url_for('static', filename=f'uploads/images/{record.load_filename}'),
+                'result':   url_for('static', filename=f'results/images/{record.result_filename}'),
             })
-
+        elif record.detect_file_type == 'video':
+            upload_path = os.path.join(UPLOAD_FOLDER, 'videos', record.load_filename)
+            result_path = os.path.join(RESULT_FOLDER, 'videos', record.result_filename)
+            if not os.path.exists(upload_path) or not os.path.exists(result_path):
+                return jsonify({'error': '文件已丢失'}), 400
+            return jsonify({
+                'code':     200,
+                'original': url_for('static', filename=f'uploads/videos/{record.load_filename}'),
+                'result':   url_for('static', filename=f'results/videos/{record.result_filename}'),
+            })
+        return jsonify({'error': '不支持的文件类型'}), 400
+    #历史记录获取api
+    @app.route('/api/history/list', methods=['GET'])
+    @login_required
+    def get_history():
+        """获取历史记录，普通用户/管理员只能看自己的，超级管理员可看所有"""
+        user = request.current_user
+        records = get_history_list(limit=100, user_id=user.id, role=user.role)
         return jsonify({
-            "success": True,
-            "list": result
+            'success': True,
+            'list': [{
+                'id':             r.id,
+                'user_id':        r.user_id,
+                'fileName':       r.load_filename,
+                'resultFileName': r.result_filename,
+                'modelType':      r.model_type,
+                'detectFileType': r.detect_file_type,
+                'createTime':     r.create_time.strftime('%Y-%m-%d %H:%M:%S'),
+            } for r in records]
         })
+    #历史数据删除api
+    @app.route('/api/history/delete/<int:id>', methods=['GET'])
+    @login_required
+    def delete_history(id):
+        """删除检测记录，普通用户/管理员只能删除自己的，超级管理员可删除所有"""
+        record = get_record_by_id(id)
+        if not record:
+            return jsonify({'error': '当前记录不存在'}), 404
+
+        # 权限检查：普通用户和管理员只能删除自己的记录
+        user = request.current_user
+        if user.role != ROLE_SUPER_ADMIN and record.user_id != user.id:
+            return jsonify({'error': '无权限删除他人的检测记录'}), 403
+
+        if record.detect_file_type == 'image':
+            upload_path = os.path.join(UPLOAD_FOLDER, 'images', record.load_filename)
+            result_path = os.path.join(RESULT_FOLDER, 'images', record.result_filename)
+        elif record.detect_file_type == 'video':
+            upload_path = os.path.join(UPLOAD_FOLDER, 'videos', record.load_filename)
+            result_path = os.path.join(RESULT_FOLDER, 'videos', record.result_filename)
+        else:
+            return jsonify({'error': '不支持的文件类型'}), 400
+        deleted_files = []
+        for path, fname in [(upload_path, record.load_filename), (result_path, record.result_filename)]:
+            if os.path.exists(path):
+                os.remove(path)
+                deleted_files.append(fname)
+        try:
+            delete_record_by_id(id)
+            return jsonify({'success': True, 'message': f'记录 {id} 删除成功', 'deleted_files': deleted_files})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)}), 500
+    #健康查询
     @app.route('/api/health', methods=['GET'])
     def health_check():
         return jsonify({
-            'status': 'ok',
-            'model': model_file,
-            'timestamp': datetime.now().isoformat()
+            'status':    'ok',
+            'model':     model_file,
+            'timestamp': datetime.now().isoformat(),
         })
 
     return app
 
 
-# 根据不同端口启动不同模型的服务
 if __name__ == '__main__':
-    import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
-    model_type = sys.argv[2] if len(sys.argv) > 2 else 'yolo'
-
-    app = create_flask_app(model_type)
+    port       = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+    model_type = sys.argv[2]      if len(sys.argv) > 2 else 'yolo'
+    flask_app  = create_flask_app(model_type)
     print(f"启动 {model_type} 模型服务，端口: {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
