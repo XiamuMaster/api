@@ -289,6 +289,7 @@ class YOLOApp(QMainWindow):
         self.btn_start_flask.clicked.connect(self.start_flask)
         control_layout.addWidget(self.btn_start_flask)
 
+        control_layout.addStretch()  # 弹性空间，把置信度推到右边
         control_layout.addWidget(QLabel("置信度:"))
         self.conf_slider = QSlider(Qt.Horizontal)
         self.conf_slider.setMinimum(1)
@@ -296,6 +297,7 @@ class YOLOApp(QMainWindow):
         self.conf_slider.setValue(25)
         self.conf_slider.setMaximumWidth(200)
         self.conf_label = QLabel("0.25")
+        self.conf_label.setFixedWidth(40)
         self.conf_slider.valueChanged.connect(lambda v: self.conf_label.setText(f"{v / 100:.2f}"))
         control_layout.addWidget(self.conf_slider)
         control_layout.addWidget(self.conf_label)
