@@ -22,7 +22,39 @@ from database import (
     save_detection_record, get_history_list,
     get_record_by_id, delete_record_by_id,
 )
+import atexit
+import signal
+import psutil
+def clean_resources():
+    print("🧹 正在强制释放所有资源...")
+    try:
+        cv2.destroyAllWindows()  # 关闭所有OpenCV窗口
+        print("✅ OpenCV 资源已释放")
+    except:
+        pass
 
+# 强制杀死占用当前端口的进程（解决端口被旧进程卡住）
+def kill_port_process(port):
+    try:
+        for proc in psutil.process_iter(['pid', 'name']):
+            for conn in proc.connections(kind='inet'):
+                if conn.laddr.port == port:
+                    print(f"⚠️  发现端口 {port} 被占用，强制杀死进程 PID: {proc.pid}")
+                    proc.kill()
+    except:
+        pass
+
+# 注册程序退出时自动清理
+atexit.register(clean_resources)
+
+# 处理强制关闭信号（Ctrl+C）
+def handle_signal(signum, frame):
+    clean_resources()
+    print("✅ 程序安全退出")
+    os._exit(0)
+
+signal.signal(signal.SIGINT, handle_signal)
+signal.signal(signal.SIGTERM, handle_signal)
 
 def create_flask_app(model_type='yolo'):
     app = Flask(__name__, static_folder='static', static_url_path='/static')
@@ -407,6 +439,7 @@ def create_flask_app(model_type='yolo'):
 if __name__ == '__main__':
     port       = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     model_type = sys.argv[2]      if len(sys.argv) > 2 else 'yolo'
+    kill_port_process(port)
     flask_app  = create_flask_app(model_type)
     print(f"启动 {model_type} 模型服务，端口: {port}")
     flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

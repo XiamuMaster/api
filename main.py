@@ -762,8 +762,7 @@ class YOLOApp(QMainWindow):
             QMessageBox.critical(self, "错误", f"添加失败: {e}")
 
     def do_change_role(self):
-        from database.models import User
-        from database import ROLE_USER, ROLE_ADMIN, ROLE_SUPER_ADMIN
+        from database import update_user_role, get_user_by_id, ROLE_USER, ROLE_ADMIN, ROLE_SUPER_ADMIN
         user_id = self.get_selected_user_id()
         if user_id is None:
             return
@@ -774,82 +773,62 @@ class YOLOApp(QMainWindow):
         if not ok:
             return
 
-        session = _get_session()
-        user = session.query(User).filter_by(id=user_id).first()
-        if not user:
-            session.remove()
-            QMessageBox.warning(self, "提示", "用户不存在")
-            return
-
         try:
+            user = get_user_by_id(user_id)
+            if not user:
+                QMessageBox.warning(self, "提示", "用户不存在")
+                return
             old_role = user.role
-            user.role = role_map[role_text]
-            session.commit()
-            session.remove()
+            update_user_role(user, role_map[role_text])
             self.refresh_user_table()
-            self.log(f"用户 {user.username} 角色已从 {old_role} 改为 {role_text}")
+            self.log(f"用户 {user.username} 角色已从 {old_role} 改为 {role_map[role_text]}")
         except Exception as e:
-            session.rollback()
-            session.remove()
-            QMessageBox.critical(self, "错误", f"修改失败: {e}")
+            QMessageBox.critical(self, "错误", f"修改角色失败: {e}")
 
     def do_toggle_status(self):
-        from database.models import User
+        from database import update_user_status, get_user_by_id
         user_id = self.get_selected_user_id()
         if user_id is None:
             return
 
-        session = _get_session()
-        user = session.query(User).filter_by(id=user_id).first()
-        if not user:
-            session.remove()
-            QMessageBox.warning(self, "提示", "用户不存在")
-            return
-
-        new_status = not user.is_active
         try:
-            user.is_active = new_status
-            session.commit()
+            user = get_user_by_id(user_id)
+            if not user:
+                QMessageBox.warning(self, "提示", "用户不存在")
+                return
+
+            new_status = not user.is_active
+            update_user_status(user, new_status)
             status_str = '启用' if new_status else '禁用'
-            session.remove()
             self.refresh_user_table()
             self.log(f"用户 {user.username} 已{status_str}")
         except Exception as e:
-            session.rollback()
-            session.remove()
             QMessageBox.critical(self, "错误", f"操作失败: {e}")
 
     def do_delete_user(self):
-        from database.models import User
+        from database import delete_user_by_id, get_user_by_id
         user_id = self.get_selected_user_id()
         if user_id is None:
             return
 
-        session = _get_session()
-        user = session.query(User).filter_by(id=user_id).first()
-        if not user:
-            session.remove()
-            QMessageBox.warning(self, "提示", "用户不存在")
-            return
-
-        username = user.username
-        reply = QMessageBox.question(
-            self, "确认删除", f"确定删除用户「{username}」（ID={user_id}）吗？\n此操作不可恢复！",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
-        if reply != QMessageBox.Yes:
-            session.remove()
-            return
-
         try:
-            session.delete(user)
-            session.commit()
-            session.remove()
+            user = get_user_by_id(user_id)
+            if not user:
+                QMessageBox.warning(self, "提示", "用户不存在")
+                return
+
+            username = user.username
+            reply = QMessageBox.question(
+                self, "确认删除", f"确定删除用户「{username}」（ID={user_id}）吗？\n此操作不可恢复！",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            delete_user_by_id(user_id)
             self.refresh_user_table()
             self.log(f"用户 {username} 已删除")
         except Exception as e:
-            session.rollback()
-            session.remove()
             QMessageBox.critical(self, "错误", f"删除失败: {e}")
 
     def start_flask(self):
